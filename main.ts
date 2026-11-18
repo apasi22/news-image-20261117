@@ -1,823 +1,1138 @@
 // THE WORLD IN ONE DAY — Tuesday 17 November 2026.
-// A code-drawn newspaper poster: every pixel is computed here.
-// Own PNG encoder, own vector letterforms, own map and illustrations.
-// Stdlib only, no network, deterministic.
+// A code-drawn newspaper poster: 34 verified stories from one day.
+// Written fresh from scratch: own PNG encoder, own supersampled rasterizer,
+// and two original typefaces (a Didone-style serif display face and a clean
+// grotesque sans) built from outline geometry. Stdlib only, no network,
+// deterministic: the same bytes on every run.
 import * as fs from "node:fs";
-import * as path from "node:path";
 import * as zlib from "node:zlib";
 
-// ---------------------------------------------------------------- canvas
-const W = 1024, H = 1024, SS = 2; // render at 2x, downsample for antialiasing
-const SW = W * SS, SH = H * SS;
-const buf = new Uint8Array(SW * SH * 3);
+// ---------------------------------------------------------------- canvas ----
+// Everything is drawn at 4x supersampling into an RGB buffer, then box
+// downsampled to 1024x1024. The supersampling is what makes the type edges
+// genuinely smooth instead of stair-stepped.
+const W = 1024;
+const H = 1024;
+const SS = 4;
+const CW = W * SS;
+const CH = H * SS;
+const canvas = Buffer.alloc(CW * CH * 3);
 
-let clipX0 = 0, clipY0 = 0, clipX1 = SW, clipY1 = SH;
-function setClip(x0, y0, x1, y1) { // final-pixel coords
-  clipX0 = Math.max(0, Math.floor(x0 * SS)); clipY0 = Math.max(0, Math.floor(y0 * SS));
-  clipX1 = Math.min(SW, Math.ceil(x1 * SS)); clipY1 = Math.min(SH, Math.ceil(y1 * SS));
-}
-function clearClip() { clipX0 = 0; clipY0 = 0; clipX1 = SW; clipY1 = SH; }
+type RGB = [number, number, number];
+const C = (r: number, g: number, b: number): RGB => [r, g, b];
 
-function rgb(hex) {
-  return [parseInt(hex.slice(1, 3), 16), parseInt(hex.slice(3, 5), 16), parseInt(hex.slice(5, 7), 16)];
-}
-function mix(c1, c2, t) {
-  return [c1[0] + (c2[0] - c1[0]) * t, c1[1] + (c2[1] - c1[1]) * t, c1[2] + (c2[2] - c1[2]) * t];
-}
-
-function fillRect(x, y, w, h, c) { // final coords
-  const x0 = Math.max(clipX0, Math.floor(x * SS)), x1 = Math.min(clipX1, Math.ceil((x + w) * SS));
-  const y0 = Math.max(clipY0, Math.floor(y * SS)), y1 = Math.min(clipY1, Math.ceil((y + h) * SS));
-  for (let yy = y0; yy < y1; yy++) {
-    let i = (yy * SW + x0) * 3;
-    for (let xx = x0; xx < x1; xx++) { buf[i] = c[0]; buf[i + 1] = c[1]; buf[i + 2] = c[2]; i += 3; }
+function fillCanvas(rgb: RGB): void {
+  for (let i = 0; i < CW * CH; i++) {
+    canvas[i * 3] = rgb[0];
+    canvas[i * 3 + 1] = rgb[1];
+    canvas[i * 3 + 2] = rgb[2];
   }
 }
 
-function vgrad(x, y, w, h, top, bottom) {
-  const y0 = Math.max(clipY0, Math.floor(y * SS)), y1 = Math.min(clipY1, Math.ceil((y + h) * SS));
-  const x0 = Math.max(clipX0, Math.floor(x * SS)), x1 = Math.min(clipX1, Math.ceil((x + w) * SS));
-  for (let yy = y0; yy < y1; yy++) {
-    const t = h <= 0 ? 0 : (yy / SS - y) / h;
-    const c = mix(top, bottom, Math.max(0, Math.min(1, t)));
-    let i = (yy * SW + x0) * 3;
-    for (let xx = x0; xx < x1; xx++) { buf[i] = c[0]; buf[i + 1] = c[1]; buf[i + 2] = c[2]; i += 3; }
-  }
-}
-
-function hline(x, y, w, c, th) { fillRect(x, y - th / 2, w, th, c); }
-function vline(x, y, h, c, th) { fillRect(x - th / 2, y, th, h, c); }
-
-// Filled circle, final coords (cx, cy, radius).
-function circle(cx, cy, r, c) {
-  const x0 = Math.max(clipX0, Math.floor((cx - r) * SS)), x1 = Math.min(clipX1, Math.ceil((cx + r) * SS));
-  const y0 = Math.max(clipY0, Math.floor((cy - r) * SS)), y1 = Math.min(clipY1, Math.ceil((cy + r) * SS));
-  const ccx = cx * SS, ccy = cy * SS, rr = r * SS;
-  for (let yy = y0; yy < y1; yy++) {
-    const dy = yy + 0.5 - ccy;
-    const dx = Math.sqrt(Math.max(0, rr * rr - dy * dy));
-    const xa = Math.max(x0, Math.ceil(ccx - dx)), xb = Math.min(x1, Math.floor(ccx + dx));
-    let i = (yy * SW + xa) * 3;
-    for (let xx = xa; xx < xb; xx++) { buf[i] = c[0]; buf[i + 1] = c[1]; buf[i + 2] = c[2]; i += 3; }
-  }
-}
-
-// Filled ellipse, final coords.
-function ellipse(cx, cy, rx, ry, c) {
-  const x0 = Math.max(clipX0, Math.floor((cx - rx) * SS)), x1 = Math.min(clipX1, Math.ceil((cx + rx) * SS));
-  const y0 = Math.max(clipY0, Math.floor((cy - ry) * SS)), y1 = Math.min(clipY1, Math.ceil((cy + ry) * SS));
-  const ccx = cx * SS, ccy = cy * SS, arx = rx * SS, ary = ry * SS;
-  for (let yy = y0; yy < y1; yy++) {
-    const t = (yy + 0.5 - ccy) / ary;
-    const dx = arx * Math.sqrt(Math.max(0, 1 - t * t));
-    const xa = Math.max(x0, Math.ceil(ccx - dx)), xb = Math.min(x1, Math.floor(ccx + dx));
-    let i = (yy * SW + xa) * 3;
-    for (let xx = xa; xx < xb; xx++) { buf[i] = c[0]; buf[i + 1] = c[1]; buf[i + 2] = c[2]; i += 3; }
-  }
-}
-
-// Polygon fill, signed nonzero winding. polys: [{pts:[[x,y]...], s:+1|-1}]
-// Coordinates in FINAL pixels; holes use s:-1, overlapping solids stay solid.
-function fillPolys(polys, c) {
-  const edges = [];
-  let minY = Infinity, maxY = -Infinity;
-  for (const poly of polys) {
-    const pts = poly.pts, s = poly.s || 1;
-    for (let i = 0; i < pts.length; i++) {
-      const a = pts[i], b = pts[(i + 1) % pts.length];
-      const y1 = a[1] * SS, y2 = b[1] * SS;
-      if (y1 === y2) continue;
-      edges.push({ x1: a[0] * SS, y1, x2: b[0] * SS, y2, s: y2 > y1 ? s : -s });
-      if (y1 < minY) minY = y1; if (y2 < minY) minY = y2;
-      if (y1 > maxY) maxY = y1; if (y2 > maxY) maxY = y2;
+// Fill an axis-aligned rect given in 1024-space coordinates.
+function rectFill(x0: number, y0: number, x1: number, y1: number, rgb: RGB): void {
+  const ax = Math.max(0, Math.round(x0 * SS));
+  const ay = Math.max(0, Math.round(y0 * SS));
+  const bx = Math.min(CW, Math.round(x1 * SS));
+  const by = Math.min(CH, Math.round(y1 * SS));
+  for (let y = ay; y < by; y++) {
+    let p = (y * CW + ax) * 3;
+    for (let x = ax; x < bx; x++) {
+      canvas[p] = rgb[0]; canvas[p + 1] = rgb[1]; canvas[p + 2] = rgb[2];
+      p += 3;
     }
   }
-  if (!edges.length) return;
-  const y0 = Math.max(clipY0, Math.floor(minY)), y1 = Math.min(clipY1, Math.ceil(maxY));
-  const xs = [];
-  for (let yy = y0; yy < y1; yy++) {
-    const yc = yy + 0.5;
+}
+
+// Vertical gradient rect (1024-space coords), top color -> bottom color.
+function rectGradient(x0: number, y0: number, x1: number, y1: number, top: RGB, bot: RGB): void {
+  const ax = Math.max(0, Math.round(x0 * SS));
+  const ay = Math.max(0, Math.round(y0 * SS));
+  const bx = Math.min(CW, Math.round(x1 * SS));
+  const by = Math.min(CH, Math.round(y1 * SS));
+  const span = Math.max(1, by - ay);
+  for (let y = ay; y < by; y++) {
+    const t = (y - ay) / span;
+    const r = Math.round(top[0] + (bot[0] - top[0]) * t);
+    const g = Math.round(top[1] + (bot[1] - top[1]) * t);
+    const b = Math.round(top[2] + (bot[2] - top[2]) * t);
+    let p = (y * CW + ax) * 3;
+    for (let x = ax; x < bx; x++) {
+      canvas[p] = r; canvas[p + 1] = g; canvas[p + 2] = b;
+      p += 3;
+    }
+  }
+}
+
+// -------------------------------------------------------------- polygons ----
+// A path is a closed polygon in 1024-space coordinates (floats allowed).
+// A shape is [outer, ...holes]; fillShape paints it with the even-odd rule.
+// Shapes are painted one at a time and overwrite, so overlapping shapes of
+// the same color union cleanly while holes stay holes.
+type Pt = [number, number];
+type Path = Pt[];
+type Shape = Path[];
+
+function fillShape(paths: Shape, rgb: RGB): void {
+  // Collect edges in supersampled pixel space.
+  const edges: Array<[number, number, number, number]> = [];
+  let minY = Infinity;
+  let maxY = -Infinity;
+  for (const path of paths) {
+    const n = path.length;
+    for (let i = 0; i < n; i++) {
+      const a = path[i];
+      const b = path[(i + 1) % n];
+      const x0 = a[0] * SS, y0 = a[1] * SS;
+      const x1 = b[0] * SS, y1 = b[1] * SS;
+      if (y0 === y1) continue; // horizontal edges never cross a scanline center
+      edges.push([x0, y0, x1, y1]);
+      if (y0 < minY) minY = y0;
+      if (y0 > maxY) maxY = y0;
+      if (y1 < minY) minY = y1;
+      if (y1 > maxY) maxY = y1;
+    }
+  }
+  if (edges.length === 0) return;
+  const yStart = Math.max(0, Math.floor(minY));
+  const yEnd = Math.min(CH - 1, Math.ceil(maxY));
+  const xs: number[] = [];
+  for (let y = yStart; y <= yEnd; y++) {
+    const yc = y + 0.5;
     xs.length = 0;
-    for (const e of edges) {
-      if ((e.y1 <= yc && e.y2 > yc) || (e.y2 <= yc && e.y1 > yc)) {
-        xs.push([e.x1 + (yc - e.y1) * (e.x2 - e.x1) / (e.y2 - e.y1), e.s]);
+    for (let e = 0; e < edges.length; e++) {
+      const [x0, y0, x1, y1] = edges[e];
+      if ((y0 <= yc && yc < y1) || (y1 <= yc && yc < y0)) {
+        xs.push(x0 + ((yc - y0) * (x1 - x0)) / (y1 - y0));
       }
     }
-    if (!xs.length) continue;
-    xs.sort((p, q) => p[0] - q[0]);
-    let wind = 0;
-    for (let i = 0; i < xs.length; i++) {
-      const xStart = xs[i][0];
-      wind += xs[i][1];
-      const xEnd = i + 1 < xs.length ? xs[i + 1][0] : xStart;
-      if (wind !== 0 && xEnd > xStart) {
-        const xa = Math.max(clipX0, Math.ceil(xStart)), xb = Math.min(clipX1, Math.floor(xEnd));
-        let k = (yy * SW + xa) * 3;
-        for (let xx = xa; xx < xb; xx++) { buf[k] = c[0]; buf[k + 1] = c[1]; buf[k + 2] = c[2]; k += 3; }
+    if (xs.length < 2) continue;
+    xs.sort((a, b) => a - b);
+    for (let k = 0; k + 1 < xs.length; k += 2) {
+      const xa = Math.max(0, Math.ceil(xs[k] - 0.5));
+      const xb = Math.min(CW, Math.floor(xs[k + 1] - 0.5) + 1);
+      let p = (y * CW + xa) * 3;
+      for (let x = xa; x < xb; x++) {
+        canvas[p] = rgb[0]; canvas[p + 1] = rgb[1]; canvas[p + 2] = rgb[2];
+        p += 3;
       }
     }
   }
 }
-function fillPoly(pts, c) { fillPolys([{ pts, s: 1 }], c); }
 
-// Thick polyline with round joins/caps. pts in final coords.
-function strokePath(pts, w, c, closed) {
-  const n = pts.length;
-  const segs = closed ? n : n - 1;
-  for (let i = 0; i < segs; i++) {
-    const a = pts[i], b = pts[(i + 1) % n];
-    const dx = b[0] - a[0], dy = b[1] - a[1];
-    const len = Math.hypot(dx, dy);
-    if (len === 0) continue;
-    const nx = -dy / len * w / 2, ny = dx / len * w / 2;
-    fillPoly([[a[0] + nx, a[1] + ny], [b[0] + nx, b[1] + ny], [b[0] - nx, b[1] - ny], [a[0] - nx, a[1] - ny]], c);
-  }
-  for (const p of pts) circle(p[0], p[1], w / 2, c);
-}
-function line(x1, y1, x2, y2, w, c) { strokePath([[x1, y1], [x2, y2]], w, c, false); }
-
-// Dashed line, final coords.
-function dashedLine(x1, y1, x2, y2, w, c, dash, gap) {
-  const len = Math.hypot(x2 - x1, y2 - y1);
-  const ux = (x2 - x1) / len, uy = (y2 - y1) / len;
-  let d = 0;
-  while (d < len) {
-    const e = Math.min(len, d + dash);
-    line(x1 + ux * d, y1 + uy * d, x1 + ux * e, y1 + uy * e, w, c);
-    d = e + gap;
-  }
+function polyShape(pts: Path, rgb: RGB): void {
+  fillShape([pts], rgb);
 }
 
-// Quadratic bezier sampled polyline.
-function quad(p0, p1, p2, steps) {
-  const out = [];
-  for (let i = 0; i <= steps; i++) {
-    const t = i / steps, u = 1 - t;
-    out.push([u * u * p0[0] + 2 * u * t * p1[0] + t * t * p2[0],
-              u * u * p0[1] + 2 * u * t * p1[1] + t * t * p2[1]]);
+// Ellipse outline (closed polygon) in 1024-space coords.
+function ellipsePath(cx: number, cy: number, rx: number, ry: number, n = 48): Path {
+  const pts: Path = [];
+  for (let i = 0; i < n; i++) {
+    const a = (i / n) * Math.PI * 2;
+    pts.push([cx + rx * Math.cos(a), cy + ry * Math.sin(a)]);
+  }
+  return pts;
+}
+
+function circleFill(cx: number, cy: number, r: number, rgb: RGB): void {
+  fillShape([ellipsePath(cx, cy, r, r, 40)], rgb);
+}
+
+function ellipseFill(cx: number, cy: number, rx: number, ry: number, rgb: RGB): void {
+  fillShape([ellipsePath(cx, cy, rx, ry, 48)], rgb);
+}
+
+// Ring: outer ellipse minus inner ellipse (even-odd, one shape).
+function ringFill(cx: number, cy: number, rx: number, ry: number, t: number, rgb: RGB): void {
+  fillShape([ellipsePath(cx, cy, rx, ry, 48), ellipsePath(cx, cy, rx - t, ry - t, 40)], rgb);
+}
+
+// Thick straight segment as a quad (1024-space coords).
+function segQuad(x0: number, y0: number, x1: number, y1: number, w: number): Path {
+  const dx = x1 - x0, dy = y1 - y0;
+  const len = Math.hypot(dx, dy) || 1;
+  const nx = (-dy / len) * (w / 2), ny = (dx / len) * (w / 2);
+  return [[x0 + nx, y0 + ny], [x1 + nx, y1 + ny], [x1 - nx, y1 - ny], [x0 - nx, y0 - ny]];
+}
+
+function lineDraw(x0: number, y0: number, x1: number, y1: number, w: number, rgb: RGB): void {
+  fillShape([segQuad(x0, y0, x1, y1, w)], rgb);
+}
+
+// Arc polyline points (degrees, y-down screen space: angle grows clockwise
+// visually because y points down; callers use the convention they need).
+function arcPts(cx: number, cy: number, rx: number, ry: number, a0: number, a1: number, n: number): Path {
+  const pts: Path = [];
+  for (let i = 0; i <= n; i++) {
+    const a = ((a0 + ((a1 - a0) * i) / n) * Math.PI) / 180;
+    pts.push([cx + rx * Math.cos(a), cy + ry * Math.sin(a)]);
+  }
+  return pts;
+}
+
+// Downsample the 4x buffer to 1024x1024 with a box filter.
+function downsample(): Buffer {
+  const out = Buffer.alloc(W * H * 3);
+  for (let y = 0; y < H; y++) {
+    for (let x = 0; x < W; x++) {
+      let r = 0, g = 0, b = 0;
+      for (let sy = 0; sy < SS; sy++) {
+        let p = ((y * SS + sy) * CW + x * SS) * 3;
+        for (let sx = 0; sx < SS; sx++) {
+          r += canvas[p]; g += canvas[p + 1]; b += canvas[p + 2];
+          p += 3;
+        }
+      }
+      const q = (y * W + x) * 3;
+      out[q] = Math.round(r / (SS * SS));
+      out[q + 1] = Math.round(g / (SS * SS));
+      out[q + 2] = Math.round(b / (SS * SS));
+    }
   }
   return out;
 }
 
-// ---------------------------------------------------------------- PNG out
-const crcTable = (() => {
-  const t = new Int32Array(256);
+// ------------------------------------------------------------------ PNG ------
+const CRC_TABLE = (() => {
+  const table = new Int32Array(256);
   for (let n = 0; n < 256; n++) {
     let c = n;
     for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
-    t[n] = c;
+    table[n] = c;
   }
-  return t;
+  return table;
 })();
-function crc32(b) {
+
+function crc32(buf: Buffer): number {
   let c = 0xffffffff;
-  for (let i = 0; i < b.length; i++) c = crcTable[(c ^ b[i]) & 0xff] ^ (c >>> 8);
+  for (let i = 0; i < buf.length; i++) c = CRC_TABLE[(c ^ buf[i]) & 0xff] ^ (c >>> 8);
   return (c ^ 0xffffffff) >>> 0;
 }
-function chunk(type, data) {
-  const out = Buffer.alloc(12 + data.length);
-  out.writeUInt32BE(data.length, 0);
-  out.write(type, 4, "ascii");
-  data.copy(out, 8);
-  out.writeUInt32BE(crc32(Buffer.concat([Buffer.from(type, "ascii"), data])), 8 + data.length);
-  return out;
+
+function pngChunk(type: string, data: Buffer): Buffer {
+  const len = Buffer.alloc(4);
+  len.writeUInt32BE(data.length, 0);
+  const body = Buffer.concat([Buffer.from(type, "ascii"), data]);
+  const crc = Buffer.alloc(4);
+  crc.writeUInt32BE(crc32(body), 0);
+  return Buffer.concat([len, body, crc]);
 }
-function writePng(file) {
-  // Downsample 2x2 box average -> final RGB.
+
+function encodePNG(rgb: Buffer): Buffer {
+  const ihdr = Buffer.alloc(13);
+  ihdr.writeUInt32BE(W, 0);
+  ihdr.writeUInt32BE(H, 4);
+  ihdr[8] = 8; // bit depth
+  ihdr[9] = 2; // color type RGB
   const raw = Buffer.alloc(H * (1 + W * 3));
   for (let y = 0; y < H; y++) {
-    const rowStart = y * (1 + W * 3);
-    raw[rowStart] = 0;
-    for (let x = 0; x < W; x++) {
-      const sx = x * SS, sy = y * SS;
-      let r = 0, g = 0, b = 0;
-      for (let dy = 0; dy < SS; dy++) for (let dx = 0; dx < SS; dx++) {
-        const i = ((sy + dy) * SW + sx + dx) * 3;
-        r += buf[i]; g += buf[i + 1]; b += buf[i + 2];
-      }
-      const o = rowStart + 1 + x * 3;
-      raw[o] = Math.round(r / 4); raw[o + 1] = Math.round(g / 4); raw[o + 2] = Math.round(b / 4);
-    }
+    raw[y * (1 + W * 3)] = 0; // filter: none
+    rgb.copy(raw, y * (1 + W * 3) + 1, y * W * 3, (y + 1) * W * 3);
   }
-  const ihdr = Buffer.alloc(13);
-  ihdr.writeUInt32BE(W, 0); ihdr.writeUInt32BE(H, 4);
-  ihdr[8] = 8; ihdr[9] = 2; // 8-bit RGB
-  const png = Buffer.concat([
+  const idat = zlib.deflateSync(raw, { level: 9 });
+  return Buffer.concat([
     Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]),
-    chunk("IHDR", ihdr),
-    chunk("IDAT", zlib.deflateSync(raw, { level: 9 })),
-    chunk("IEND", Buffer.alloc(0)),
+    pngChunk("IHDR", ihdr),
+    pngChunk("IDAT", idat),
+    pngChunk("IEND", Buffer.alloc(0)),
   ]);
-  fs.mkdirSync(path.dirname(file), { recursive: true });
-  fs.writeFileSync(file, png);
-  return png.length;
 }
 
-// ---------------------------------------------------------------- letterforms
-// Vector capitals on a 12x16 grid: filled polygons (with signed holes) and
-// thick strokes with round joins. Thick verticals, thinner horizontals,
-// flared feet on stemmed letters: a sturdy editorial face that stays smooth
-// when scaled, unlike a bitmap font.
-// Shape: {p:[[x,y]...], h:1} polygon (h = hole) or {l:[[x,y]...], w, c:1} stroke.
-const G = {
-  A: { a: 12, sh: [{ p: [[6, 0], [12, 16], [9.1, 16], [7.7, 11.6], [4.3, 11.6], [2.9, 16], [0, 16]] }, { p: [[6, 4.4], [8.2, 9.6], [3.8, 9.6]], h: 1 }] },
-  B: { a: 12, sh: [{ p: [[0, 0], [7.5, 0], [11, 2.6], [11, 6.2], [9.6, 8], [11, 9.8], [11, 13.4], [7.5, 16], [0, 16]] }, { p: [[3, 2.8], [7, 2.8], [8.2, 4.2], [8.2, 5.6], [7, 6.8], [3, 6.8]], h: 1 }, { p: [[3, 9.2], [7.2, 9.2], [8.4, 10.6], [8.4, 12.2], [7.2, 13.4], [3, 13.4]], h: 1 }] },
-  C: { a: 12, sh: [{ l: [[10.5, 3.5], [8, 1.5], [4.5, 1.5], [2, 4], [1.5, 8], [2, 12], [4.5, 14.5], [8, 14.5], [10.5, 12.5]], w: 3 }] },
-  D: { a: 12, sh: [{ p: [[0, 0], [7, 0], [11, 3], [12, 8], [11, 13], [7, 16], [0, 16]] }, { p: [[3.2, 3], [6.6, 3], [8.6, 5.4], [8.6, 10.6], [6.6, 13], [3.2, 13]], h: 1 }] },
-  E: { a: 11, sh: [{ p: [[0, 0], [11, 0], [11, 2.8], [3.2, 2.8], [3.2, 6.6], [9.5, 6.6], [9.5, 9.4], [3.2, 9.4], [3.2, 13.2], [11, 13.2], [11, 16], [0, 16]] }] },
-  F: { a: 11, sh: [{ p: [[0, 0], [11, 0], [11, 2.8], [3.2, 2.8], [3.2, 6.6], [9.5, 6.6], [9.5, 9.4], [3.2, 9.4], [3.2, 16], [0, 16]] }] },
-  G: { a: 12, sh: [{ l: [[10.5, 3.5], [8, 1.5], [4.5, 1.5], [2, 4], [1.5, 8], [2, 12], [4.5, 14.5], [8, 14.5], [10.5, 12.5], [10.5, 8.5]], w: 3 }, { p: [[6.5, 8], [10.8, 8], [10.8, 10.6], [6.5, 10.6]] }] },
-  H: { a: 12, sh: [{ p: [[0, 0], [3.2, 0], [3.2, 6.6], [8.8, 6.6], [8.8, 0], [12, 0], [12, 16], [8.8, 16], [8.8, 9.4], [3.2, 9.4], [3.2, 16], [0, 16]] }] },
-  I: { a: 8, sh: [{ p: [[0.5, 0], [7.5, 0], [7.5, 2.6], [5.1, 2.6], [5.1, 13.4], [7.5, 13.4], [7.5, 16], [0.5, 16], [0.5, 13.4], [2.9, 13.4], [2.9, 2.6], [0.5, 2.6]] }] },
-  J: { a: 10, sh: [{ l: [[7, 1], [7, 10.5], [5.8, 13], [3.5, 13.2], [1.8, 11.4]], w: 2.9 }, { p: [[2.5, 0], [9.5, 0], [9.5, 2.6], [2.5, 2.6]] }] },
-  K: { a: 12, sh: [{ p: [[0, 0], [3.2, 0], [3.2, 6.8], [6.4, 3.2], [9.8, 0], [12, 0], [12, 1.8], [8.2, 6.4], [12, 14.2], [12, 16], [9.6, 16], [6.2, 10.4], [3.2, 13.6], [3.2, 16], [0, 16]] }] },
-  L: { a: 11, sh: [{ p: [[0, 0], [3.2, 0], [3.2, 13.2], [11, 13.2], [11, 16], [0, 16]] }] },
-  M: { a: 13, sh: [{ p: [[0, 16], [0, 0], [3.4, 0], [6.5, 6.5], [9.6, 0], [13, 0], [13, 16], [9.8, 16], [9.8, 6.8], [6.5, 12], [3.2, 6.8], [3.2, 16]] }] },
-  N: { a: 12, sh: [{ p: [[0, 16], [0, 0], [3, 0], [9, 10.5], [9, 0], [12, 0], [12, 16], [9, 16], [3, 5.5], [3, 16]] }] },
-  O: { a: 12, sh: [{ l: [[6, 1], [8.5, 2], [10.5, 4.5], [11, 8], [10.5, 11.5], [8.5, 14], [6, 15], [3.5, 14], [1.5, 11.5], [1, 8], [1.5, 4.5], [3.5, 2]], w: 3, c: 1 }] },
-  P: { a: 11, sh: [{ p: [[0, 0], [7.5, 0], [11, 2.6], [11, 6.8], [7.5, 9.6], [3.2, 9.6], [3.2, 16], [0, 16]] }, { p: [[3.2, 2.8], [7, 2.8], [8.2, 4.2], [8.2, 5.6], [7, 6.8], [3.2, 6.8]], h: 1 }] },
-  Q: { a: 12, sh: [{ l: [[6, 1], [8.5, 2], [10.5, 4.5], [11, 8], [10.5, 11.5], [8.5, 14], [6, 15], [3.5, 14], [1.5, 11.5], [1, 8], [1.5, 4.5], [3.5, 2]], w: 3, c: 1 }, { p: [[7.5, 11], [11.8, 15.8], [11.8, 17.6], [9.6, 17.6], [6.4, 13]] }] },
-  R: { a: 12, sh: [{ p: [[0, 0], [7.5, 0], [11, 2.6], [11, 6.8], [9.4, 8.6], [12, 16], [9, 16], [6.6, 10], [3.2, 10], [3.2, 16], [0, 16]] }, { p: [[3.2, 2.8], [7, 2.8], [8.2, 4.2], [8.2, 5.6], [7, 6.8], [3.2, 6.8]], h: 1 }] },
-  S: { a: 12, sh: [{ l: [[9.5, 3], [7, 1.8], [4, 2.4], [2.4, 4.6], [3, 7], [5.5, 8.2], [8, 9.2], [9.6, 11.2], [9, 13.6], [6.5, 14.8], [3.8, 14.2], [2.2, 12.4]], w: 2.9 }] },
-  T: { a: 12, sh: [{ p: [[0, 0], [12, 0], [12, 2.8], [0, 2.8]] }, { p: [[4.6, 2.8], [7.4, 2.8], [7.4, 13.6], [8.8, 13.6], [8.8, 16], [3.2, 16], [3.2, 13.6], [4.6, 13.6]] }] },
-  U: { a: 12, sh: [{ l: [[1.8, 0.5], [1.8, 11], [3.5, 14], [6, 15], [8.5, 14], [10.2, 11], [10.2, 0.5]], w: 3 }] },
-  V: { a: 12, sh: [{ p: [[0, 0], [3.2, 0], [6, 11.5], [8.8, 0], [12, 0], [7.6, 16], [4.4, 16]] }] },
-  W: { a: 13, sh: [{ p: [[0, 0], [3, 0], [4.8, 9], [6.5, 3.5], [8.2, 9], [9.8, 0], [13, 0], [10.6, 16], [7.4, 16], [6.5, 12], [5.6, 16], [2.4, 16]] }] },
-  X: { a: 12, sh: [{ p: [[0, 0], [3.4, 0], [6, 5.5], [8.6, 0], [12, 0], [7.6, 8], [12, 16], [8.6, 16], [6, 10.5], [3.4, 16], [0, 16], [4.4, 8]] }] },
-  Y: { a: 12, sh: [{ p: [[0, 0], [3.2, 0], [6, 6], [8.8, 0], [12, 0], [7.6, 9.5], [7.6, 16], [4.4, 16], [4.4, 9.5]] }] },
-  Z: { a: 12, sh: [{ p: [[0, 0], [12, 0], [12, 2.8], [4.6, 13.2], [12, 13.2], [12, 16], [0, 16], [0, 13.2], [7.4, 2.8], [0, 2.8]] }] },
-  "0": { a: 11, sh: [{ l: [[5.5, 1], [8, 2], [9.8, 4.5], [10.3, 8], [9.8, 11.5], [8, 14], [5.5, 15], [3, 14], [1.2, 11.5], [0.7, 8], [1.2, 4.5], [3, 2]], w: 2.8, c: 1 }] },
-  "1": { a: 9, sh: [{ p: [[4.5, 1.2], [7.3, 0], [7.3, 16], [4.5, 16]] }, { p: [[4.5, 1.2], [7.3, 0], [7.3, 2.6], [5.4, 4.6], [3.2, 5.6], [2.4, 3.4]] }, { p: [[2.5, 13.4], [8.5, 13.4], [8.5, 16], [2.5, 16]] }] },
-  "2": { a: 11, sh: [{ l: [[3, 4], [4.5, 2], [7, 1.8], [9, 3.2], [9.5, 5.5], [8, 7.5], [3, 13], [2.5, 14.5]], w: 2.8 }, { p: [[2, 13.4], [10.5, 13.4], [10.5, 16], [2, 16]] }] },
-  "3": { a: 11, sh: [{ l: [[3.5, 2.8], [5.5, 1.6], [8, 2.2], [9.6, 4.2], [9, 6.6], [7, 7.8], [9, 9.2], [9.6, 11.8], [8, 14.2], [5.5, 15.4], [3.5, 14.2]], w: 2.8 }] },
-  "4": { a: 11, sh: [{ p: [[1.5, 10], [6.5, 0], [9, 0], [9, 10], [11, 10], [11, 12.8], [9, 12.8], [9, 16], [6.2, 16], [6.2, 12.8], [1.5, 12.8]] }, { p: [[4, 9.8], [6.2, 6.6], [6.2, 9.8]], h: 1 }] },
-  "5": { a: 11, sh: [{ l: [[9.5, 2], [3, 2], [3, 7], [7, 7.5], [9.3, 9.5], [9.3, 12], [7, 14.5], [4, 14.5], [2.8, 13]], w: 2.8 }] },
-  "6": { a: 11, sh: [{ l: [[9, 2], [6, 1.5], [3.5, 3.5], [2.5, 7], [3, 11], [5, 14], [8, 14.5], [9.5, 12], [9.5, 9.5], [8, 7.5], [5.5, 7], [3.5, 8]], w: 2.8 }] },
-  "7": { a: 11, sh: [{ p: [[1.5, 0], [10.5, 0], [10.5, 2.8], [7.8, 2.8], [5.6, 16], [2.8, 16], [5, 2.8], [1.5, 2.8]] }] },
-  "8": { a: 11, sh: [{ l: [[5.5, 1.5], [7.5, 2.5], [8.5, 4.5], [7.5, 7], [5.5, 7.8], [3.5, 7], [2.5, 4.5], [3.5, 2.5]], w: 2.6, c: 1 }, { l: [[5.5, 8.2], [8, 9], [9.3, 11], [8.5, 14], [5.5, 15.5], [2.5, 14], [1.7, 11], [3, 9]], w: 2.6, c: 1 }] },
-  "9": { a: 11, sh: [{ l: [[3, 14], [6, 14.5], [8.5, 12.5], [9.5, 9], [9, 5], [7, 2], [4, 1.5], [2.5, 4], [2.5, 6.5], [4, 8.5], [6.5, 9], [8.5, 8]], w: 2.8 }] },
-  " ": { a: 6, sh: [] },
-  ".": { a: 6, sh: [{ p: [[1.5, 13], [4.5, 13], [4.5, 16], [1.5, 16]] }] },
-  ",": { a: 6, sh: [{ p: [[1.5, 13], [4.5, 13], [4.5, 15], [3.2, 18], [1.2, 18], [2.5, 15]] }] },
-  ":": { a: 6, sh: [{ p: [[1.5, 3.5], [4.5, 3.5], [4.5, 6.5], [1.5, 6.5]] }, { p: [[1.5, 10], [4.5, 10], [4.5, 13], [1.5, 13]] }] },
-  ";": { a: 6, sh: [{ p: [[1.5, 3.5], [4.5, 3.5], [4.5, 6.5], [1.5, 6.5]] }, { p: [[1.5, 10], [4.5, 10], [4.5, 12], [3.2, 15], [1.2, 15], [2.5, 12]] }] },
-  $: { a: 11, sh: [{ l: [[8.5, 3], [6, 2], [3.8, 3.2], [3.2, 5.2], [4.5, 6.8], [7.5, 7.6], [8.8, 9.4], [8, 12], [5.5, 13], [3.5, 12]], w: 2.1 }, { p: [[5, 0], [6.6, 0], [6.6, 16], [5, 16]] }] },
-  "%": { a: 12, sh: [{ l: [[3, 1.5], [4.6, 2.4], [5.2, 4], [4.6, 5.6], [3, 6.5], [1.4, 5.6], [0.8, 4], [1.4, 2.4]], w: 1.9, c: 1 }, { l: [[9, 9.5], [10.6, 10.4], [11.2, 12], [10.6, 13.6], [9, 14.5], [7.4, 13.6], [6.8, 12], [7.4, 10.4]], w: 1.9, c: 1 }, { p: [[9.5, 0.5], [11.2, 2], [3.2, 15.5], [1.5, 14]] }] },
-  "-": { a: 8, sh: [{ p: [[1, 7], [7, 7], [7, 9.5], [1, 9.5]] }] },
-  "'": { a: 4, sh: [{ p: [[1.5, 0], [3.5, 0], [2.8, 4], [1, 4.5]] }] },
-  "/": { a: 8, sh: [{ p: [[5.5, 0], [7.5, 0], [2.5, 16], [0.5, 16]] }] },
-  "(": { a: 7, sh: [{ l: [[5.5, 1], [3.5, 3], [2.8, 8], [3.5, 13], [5.5, 15]], w: 2.4 }] },
-  ")": { a: 7, sh: [{ l: [[1.5, 1], [3.5, 3], [4.2, 8], [3.5, 13], [1.5, 15]], w: 2.4 }] },
-  "+": { a: 10, sh: [{ p: [[4.2, 3], [5.8, 3], [5.8, 7], [9, 7], [9, 9], [5.8, 9], [5.8, 13], [4.2, 13], [4.2, 9], [1, 9], [1, 7], [4.2, 7]] }] },
-  "!": { a: 6, sh: [{ p: [[2, 0], [4, 0], [3.7, 10], [2.3, 10]] }, { p: [[2, 12.5], [4, 12.5], [4, 15.5], [2, 15.5]] }] },
-  "=": { a: 9, sh: [{ p: [[1, 4.5], [8, 4.5], [8, 6.8], [1, 6.8]] }, { p: [[1, 9.5], [8, 9.5], [8, 11.8], [1, 11.8]] }] },
+// ============================================================ TYPEFACES =====
+// Two original faces, both defined as outline geometry on a 100-unit em
+// (cap height 70, baseline 0, y grows UP in glyph space; the text engine
+// flips to screen space). Curves are finely segmented arcs so rounds are
+// genuinely round. A glyph is a list of shapes; a shape is [outer, ...holes]
+// filled even-odd; shapes union by overwrite, so strokes may overlap freely
+// while counters stay open.
+
+interface Glyph { adv: number; shapes: Shape[]; }
+type Face = Record<string, Glyph>;
+
+// --- glyph-space geometry helpers (y-up) ---
+function gArc(cx: number, cy: number, rx: number, ry: number, a0: number, a1: number, n: number): Path {
+  const pts: Path = [];
+  for (let i = 0; i <= n; i++) {
+    const a = ((a0 + ((a1 - a0) * i) / n) * Math.PI) / 180;
+    pts.push([cx + rx * Math.cos(a), cy + ry * Math.sin(a)]);
+  }
+  return pts;
+}
+function gEllipse(cx: number, cy: number, rx: number, ry: number, n = 44): Path {
+  return gArc(cx, cy, rx, ry, 0, 360, n);
+}
+function gRect(x0: number, y0: number, x1: number, y1: number): Path {
+  return [[x0, y0], [x1, y0], [x1, y1], [x0, y1]];
+}
+function gDiag(x0: number, y0: number, x1: number, y1: number, w: number): Path {
+  const dx = x1 - x0, dy = y1 - y0;
+  const len = Math.hypot(dx, dy) || 1;
+  const nx = (-dy / len) * (w / 2), ny = (dx / len) * (w / 2);
+  return [[x0 + nx, y0 + ny], [x1 + nx, y1 + ny], [x1 - nx, y1 - ny], [x0 - nx, y0 - ny]];
+}
+// Thick arc band: outer arc a0->a1, inner arc back. Constant thickness t.
+function gBand(cx: number, cy: number, rx: number, ry: number, a0: number, a1: number, t: number, n = 30): Path {
+  return [...gArc(cx, cy, rx, ry, a0, a1, n), ...gArc(cx, cy, rx - t, ry - t, a1, a0, n)];
+}
+// Contrast band: inner ellipse offset so the stroke is thick on one side
+// and thin on the other (the Didone trick).
+function gBandC(cx: number, cy: number, rx: number, ry: number, a0: number, a1: number,
+  tx: number, ty: number, ox: number, oy: number, n = 30): Path {
+  return [...gArc(cx, cy, rx, ry, a0, a1, n),
+    ...gArc(cx + ox, cy + oy, rx - tx, ry - ty, a1, a0, n)];
+}
+// Smooth stroke along a spine: quads between points + discs at joints.
+function gStroke(spine: Path, w: number): Shape[] {
+  const shapes: Shape[] = [];
+  for (let i = 0; i + 1 < spine.length; i++) {
+    shapes.push([gDiag(spine[i][0], spine[i][1], spine[i + 1][0], spine[i + 1][1], w)]);
+  }
+  for (const [x, y] of spine) shapes.push([gEllipse(x, y, w / 2, w / 2, 18)]);
+  return shapes;
+}
+const G = (adv: number, shapes: Shape[]): Glyph => ({ adv, shapes });
+const S1 = (p: Path): Shape => [p];
+
+// ------------------------------------------------------- sans grotesque ----
+// Clean news sans, parameterized by stem width s so one construction yields
+// regular, medium and bold weights with identical proportions.
+function buildSans(s: number): Face {
+  const f: Face = {};
+  const mid = s * 0.85;
+  f[" "] = G(28, []);
+  f["A"] = G(72, [[[[0, 0], [36, 72], [72, 0], [59, 0], [52, 26], [20, 26], [13, 0]],
+    [[36, 44], [23, 34], [49, 34]]]]);
+  f["B"] = G(68, [S1(gRect(0, 0, s, 70)),
+    S1(gBand(s, 52.5, 68 - s, 17.5, 90, -90, s)),
+    S1(gBand(s, 17.5, 68 - s, 17.5, 90, -90, s))]);
+  f["C"] = G(70, [S1(gBand(36, 35, 34, 35, 55, 305, s))]);
+  f["D"] = G(70, [S1(gRect(0, 0, s, 70)), S1(gBand(s, 35, 70 - s, 35, 90, -90, s))]);
+  f["E"] = G(62, [S1(gRect(0, 0, s, 70)), S1(gRect(0, 70 - s, 62, 70)),
+    S1(gRect(0, 35 - mid / 2, 50, 35 + mid / 2)), S1(gRect(0, 0, 62, s))]);
+  f["F"] = G(58, [S1(gRect(0, 0, s, 70)), S1(gRect(0, 70 - s, 58, 70)),
+    S1(gRect(0, 35 - mid / 2, 48, 35 + mid / 2))]);
+  f["G"] = G(72, [S1(gBand(36, 35, 34, 35, 55, 305, s)),
+    S1(gRect(38, 26, 70, 26 + s)), S1(gRect(70 - s, 12, 70, 26 + s))]);
+  f["H"] = G(72, [S1(gRect(0, 0, s, 70)), S1(gRect(72 - s, 0, 72, 70)),
+    S1(gRect(0, 35 - mid / 2, 72, 35 + mid / 2))]);
+  f["I"] = G(26, [S1(gRect(5, 0, 5 + s + 2, 70))]);
+  f["J"] = G(56, [S1(gRect(56 - s, 16, 56, 70)),
+    S1(gBand(30, 16, 26, 16, 0, -180, s))]);
+  f["K"] = G(68, [S1(gRect(0, 0, s, 70)),
+    S1(gDiag(s + 2, 36, 68, 70, s)), S1(gDiag(s + 6, 32, 68, 0, s))]);
+  f["L"] = G(58, [S1(gRect(0, 0, s, 70)), S1(gRect(0, 0, 58, s))]);
+  f["M"] = G(84, [S1(gRect(0, 0, s, 70)), S1(gRect(84 - s, 0, 84, 70)),
+    S1(gDiag(s, 70, 42, 16, mid)), S1(gDiag(84 - s, 70, 42, 16, mid))]);
+  f["N"] = G(72, [S1(gRect(0, 0, s, 70)), S1(gRect(72 - s, 0, 72, 70)),
+    S1(gDiag(3, 68, 69, 2, mid))]);
+  f["O"] = G(72, [[[gEllipse(36, 35, 35, 36)][0], gEllipse(36, 35, 35 - s, 36 - s)]]);
+  f["P"] = G(64, [S1(gRect(0, 0, s, 70)), S1(gBand(s, 52, 64 - s, 18, 90, -90, s))]);
+  f["Q"] = G(72, [[[gEllipse(36, 35, 35, 36)][0], gEllipse(36, 35, 35 - s, 36 - s)],
+    S1(gDiag(44, 16, 68, -6, mid))]);
+  f["R"] = G(68, [S1(gRect(0, 0, s, 70)), S1(gBand(s, 52, 64 - s, 18, 90, -90, s)),
+    S1(gDiag(s + 8, 34, 68, 0, s))]);
+  // S spine: two arcs flowing through the middle, constant stroke.
+  {
+    const spine: Path = [];
+    for (const a of [30, 60, 90, 120, 150, 180, 210, 240, 270]) {
+      const r = (a * Math.PI) / 180;
+      spine.push([32 + 18 * Math.cos(r), 50 + 18 * Math.sin(r)]);
+    }
+    for (const a of [90, 60, 30, 0, -30, -60, -90, -120, -150]) {
+      const r = (a * Math.PI) / 180;
+      spine.push([32 + 18 * Math.cos(r), 20 + 18 * Math.sin(r)]);
+    }
+    f["S"] = G(64, gStroke(spine, s));
+  }
+  f["T"] = G(62, [S1(gRect(0, 70 - s, 62, 70)), S1(gRect(31 - s / 2, 0, 31 + s / 2, 70 - s))]);
+  f["U"] = G(70, [S1(gRect(0, 14, s, 70)), S1(gRect(70 - s, 14, 70, 70)),
+    S1(gBand(35, 16, 35, 16, 180, 360, s))]);
+  f["V"] = G(70, [S1(gDiag(0, 70, 35, -2, s)), S1(gDiag(70, 70, 35, -2, s))]);
+  f["W"] = G(92, [S1(gDiag(0, 70, 23, -2, s)), S1(gDiag(23, -2, 46, 40, s)),
+    S1(gDiag(46, 40, 69, -2, s)), S1(gDiag(69, -2, 92, 70, s))]);
+  f["X"] = G(68, [S1(gDiag(0, 70, 68, 0, s)), S1(gDiag(68, 70, 0, 0, s))]);
+  f["Y"] = G(66, [S1(gDiag(0, 70, 33, 32, s)), S1(gDiag(66, 70, 33, 32, s)),
+    S1(gRect(33 - s / 2, 0, 33 + s / 2, 36))]);
+  f["Z"] = G(62, [S1(gRect(0, 70 - s, 62, 70)), S1(gDiag(58, 68, 4, 2, mid)), S1(gRect(0, 0, 62, s))]);
+  // Digits (tabular, adv 58).
+  f["0"] = G(58, [[[gEllipse(29, 35, 28, 36)][0], gEllipse(29, 35, 28 - s, 36 - s)]]);
+  f["1"] = G(58, [S1(gDiag(10, 52, 26, 70, mid)), S1(gRect(24, 0, 24 + s, 70)), S1(gRect(14, 0, 44, s))]);
+  f["2"] = G(58, [S1(gBand(29, 50, 26, 20, 10, 195, s)),
+    S1(gDiag(8, 46, 52, 6, s)), S1(gRect(2, 0, 56, s))]);
+  f["3"] = G(60, [S1(gBand(30, 52, 26, 18, 140, -70, s)),
+    S1(gBand(30, 18, 28, 18, 90, -160, s))]);
+  f["4"] = G(56, [S1(gDiag(44, 70, 8, 18, mid)), S1(gRect(4, 16, 52, 16 + s)), S1(gRect(40, 0, 40 + s, 70))]);
+  f["5"] = G(58, [S1(gRect(4, 70 - s, 54, 70)), S1(gRect(4, 36, 4 + s, 70)),
+    S1(gRect(4, 36 - mid, 32, 36)), S1(gBand(28, 18, 26, 18, 90, -160, s))]);
+  f["6"] = G(58, [[[gEllipse(29, 20, 27, 21)][0], gEllipse(29, 20, 27 - s, 21 - s)],
+    S1(gBand(29, 46, 24, 22, 45, 215, s))]);
+  f["7"] = G(58, [S1(gRect(2, 70 - s, 56, 70)), S1(gDiag(52, 68, 24, 0, s))]);
+  f["8"] = G(58, [[[gEllipse(29, 51, 25, 19)][0], gEllipse(29, 51, 25 - s, 19 - s)],
+    [[gEllipse(29, 19, 28, 20)][0], gEllipse(29, 19, 28 - s, 20 - s)]]);
+  f["9"] = G(58, [[[gEllipse(29, 50, 27, 21)][0], gEllipse(29, 50, 27 - s, 21 - s)],
+    S1(gRect(56 - s, 16, 56, 56)), S1(gBand(29, 18, 27, 18, 0, -180, s))]);
+  // Punctuation.
+  f["."] = G(30, [S1(gEllipse(15, 6, 6.5, 6.5, 18))]);
+  f[","] = G(30, [S1(gEllipse(15, 6, 6.5, 6.5, 18)), S1(gDiag(19, 8, 9, -12, 7))]);
+  f[":"] = G(32, [S1(gEllipse(16, 52, 6.5, 6.5, 18)), S1(gEllipse(16, 14, 6.5, 6.5, 18))]);
+  f[";"] = G(32, [S1(gEllipse(16, 52, 6.5, 6.5, 18)), S1(gEllipse(16, 8, 6.5, 6.5, 18)),
+    S1(gDiag(20, 10, 10, -12, 7))]);
+  f["'"] = G(26, [S1(gDiag(16, 70, 10, 52, 9))]);
+  f["’"] = f["'"];
+  f["-"] = G(38, [S1(gRect(4, 28, 34, 28 + mid))]);
+  f["–"] = G(48, [S1(gRect(2, 28, 46, 28 + mid))]);
+  f["—"] = G(64, [S1(gRect(0, 28, 64, 28 + mid))]);
+  f["%"] = G(64, [[[gEllipse(16, 54, 11, 12)][0], gEllipse(16, 54, 5, 6)],
+    [[gEllipse(48, 16, 11, 12)][0], gEllipse(48, 16, 5, 6)],
+    S1(gDiag(14, 6, 52, 66, mid))]);
+  f["$"] = G(58, (() => {
+    const spine: Path = [];
+    for (const a of [30, 60, 90, 120, 150, 180, 210, 240, 270]) {
+      const r = (a * Math.PI) / 180;
+      spine.push([29 + 16 * Math.cos(r), 50 + 16 * Math.sin(r)]);
+    }
+    for (const a of [90, 60, 30, 0, -30, -60, -90, -120, -150]) {
+      const r = (a * Math.PI) / 180;
+      spine.push([29 + 16 * Math.cos(r), 20 + 16 * Math.sin(r)]);
+    }
+    return [...gStroke(spine, s * 0.9), S1(gRect(29 - s * 0.4, -8, 29 + s * 0.4, 78))];
+  })());
+  f["+"] = G(58, [S1(gRect(24, 10, 34, 60)), S1(gRect(9, 25, 49, 35))]);
+  f["/"] = G(58, [S1(gDiag(12, -2, 46, 72, mid))]);
+  f["("] = G(34, [S1(gBand(34, 35, 22, 38, 130, 230, mid))]);
+  f[")"] = G(34, [S1(gBand(2, 35, 22, 38, -50, 50, mid))]);
+  f["!"] = G(30, [S1(gRect(12, 22, 12 + s, 70)), S1(gEllipse(16, 6, 6.5, 6.5, 18))]);
+  f["?"] = G(56, [S1(gBand(28, 52, 24, 18, 10, 200, mid)),
+    S1(gDiag(8, 46, 26, 30, mid)), S1(gRect(24, 22, 24 + s, 32)),
+    S1(gEllipse(28, 6, 6.5, 6.5, 18))]);
+  f['"'] = G(40, [S1(gDiag(10, 70, 14, 54, 8)), S1(gDiag(26, 70, 30, 54, 8))]);
+  f["•"] = G(32, [S1(gEllipse(16, 32, 8, 8, 20))]);
+  f["·"] = G(26, [S1(gEllipse(13, 32, 5, 5, 16))]);
+  return f;
+}
+
+// ------------------------------------------------- serif display face ------
+// A Didone-style nameplate face: strong thick/thin contrast, bracketed
+// slab serifs, sharp apexes, high-contrast rounds (thick sides, thin
+// crowns). Used for the masthead, the giant date, the subhead and the
+// ALSO header. Only the glyphs those strings need are defined.
+function buildSerif(): Face {
+  const f: Face = {};
+  const T = 15; // thick stem
+  const t = 5;  // thin stroke
+  f[" "] = G(30, []);
+  // Bracketed serif slab centered at cx for a stem of width w, sitting on
+  // baseline y and rising `up` units (dir +1) or hanging down (dir -1).
+  function slab(cx: number, w: number, y: number, dir: 1 | -1): Path {
+    const h = 6, ext = 5;
+    const y0 = y, y1 = y + dir * 2.5, y2 = y + dir * 4.5, y3 = y + dir * h;
+    return [
+      [cx - w / 2 - ext, y0], [cx - w / 2 - ext, y1], [cx - w / 2 - 1.5, y2],
+      [cx - w / 2, y3], [cx + w / 2, y3], [cx + w / 2 + 1.5, y2],
+      [cx + w / 2 + ext, y1], [cx + w / 2 + ext, y0],
+    ];
+  }
+  // Vertical stem with top and bottom bracketed serifs.
+  function stem(x: number, w: number, y0: number, y1: number): Shape[] {
+    return [S1(gRect(x, y0, x + w, y1)),
+      S1(slab(x + w / 2, w, y1, -1)), S1(slab(x + w / 2, w, y0, 1))];
+  }
+  // High-contrast ring: thick sides (ts), thin top/bottom (tt).
+  function oring(cx: number, cy: number, rx: number, ry: number, ts: number, tt: number): Shape {
+    return [gEllipse(cx, cy, rx, ry), gEllipse(cx, cy, rx - ts, ry - tt)];
+  }
+  f["A"] = G(72, [S1(gDiag(2, 0, 36, 72, T)), S1(gDiag(70, 0, 36, 72, t)),
+    S1(gRect(20, 24, 52, 29)), S1(gRect(-4, 0, 11, 4.5)), S1(gRect(61, 0, 76, 4.5))]);
+  f["B"] = G(68, [...stem(2, T, 0, 70),
+    S1(gBandC(17, 52, 47, 18, 90, -90, 13, 5, 3, 0)),
+    S1(gBandC(17, 18, 49, 18, 90, -90, 13, 5, 3, 0))]);
+  f["D"] = G(70, [...stem(2, T, 0, 70),
+    S1(gBandC(17, 35, 51, 36, 90, -90, 13, 5, 3, 0))]);
+  f["E"] = G(62, [...stem(2, T, 0, 70), S1(gRect(2, 64, 58, 70)),
+    S1(gRect(2, 32, 48, 37)), S1(gRect(2, 0, 58, 6))]);
+  f["F"] = G(58, [...stem(2, T, 0, 70), S1(gRect(2, 64, 56, 70)), S1(gRect(2, 32, 46, 37))]);
+  f["H"] = G(72, [...stem(2, T, 0, 70), ...stem(55, T, 0, 70), S1(gRect(2, 32, 70, 37))]);
+  f["I"] = G(34, [S1(gRect(9, 0, 24, 70)), S1(slab(16.5, 15, 70, -1)), S1(slab(16.5, 15, 0, 1))]);
+  f["L"] = G(60, [...stem(2, T, 0, 70), S1(gRect(2, 0, 56, 6)), S1(gRect(52, 0, 56, 11))]);
+  f["M"] = G(86, [...stem(2, T, 0, 70), ...stem(69, T, 0, 70),
+    S1(gDiag(15, 68, 42, 6, t)), S1(gDiag(71, 68, 44, 6, t))]);
+  f["N"] = G(72, [...stem(2, T, 0, 70), ...stem(55, T, 0, 70), S1(gDiag(15, 68, 57, 2, t))]);
+  f["O"] = G(72, [oring(36, 35, 35, 36, 14, 5)]);
+  f["P"] = G(64, [...stem(2, T, 0, 70), S1(gBandC(17, 52, 45, 18, 90, -90, 13, 5, 3, 0))]);
+  f["R"] = G(68, [...stem(2, T, 0, 70), S1(gBandC(17, 52, 47, 18, 90, -90, 13, 5, 3, 0)),
+    S1(gDiag(24, 36, 64, 0, 9)), S1(gRect(58, 0, 70, 4.5))]);
+  f["S"] = G(64, [S1(gBandC(32, 52, 30, 18, 30, 270, 11, 5, 2, -2)),
+    S1(gBandC(32, 18, 30, 18, 90, -150, 11, 5, -2, 2))]);
+  f["T"] = G(64, [S1(gRect(0, 63, 64, 70)),
+    S1([[0, 64], [9, 64], [7, 59], [2, 59]]), S1([[64, 64], [55, 64], [57, 59], [62, 59]]),
+    ...stem(24.5, T, 0, 64)]);
+  f["U"] = G(72, [S1(gRect(2, 20, 17, 70)), S1(slab(9.5, T, 70, -1)),
+    S1(gRect(55, 20, 70, 70)), S1(slab(62.5, T, 70, -1)),
+    S1(gBandC(36, 22, 34, 22, 180, 360, 13, 5, 0, 2))]);
+  f["V"] = G(72, [S1(gDiag(2, 70, 36, -2, T)), S1(gDiag(70, 70, 36, -2, t))]);
+  f["W"] = G(88, [S1(gDiag(0, 70, 22, 0, 13)), S1(gDiag(22, 0, 44, 56, t)),
+    S1(gDiag(44, 56, 66, 0, t)), S1(gDiag(66, 0, 88, 70, 13)),
+    S1(gRect(15, 0, 29, 4)), S1(gRect(59, 0, 73, 4))]);
+  f["Y"] = G(72, [S1(gDiag(2, 70, 36, 32, 13)), S1(gDiag(70, 70, 36, 32, t)),
+    ...stem(28.5, T, 0, 34)]);
+  f["0"] = G(58, [oring(29, 35, 28, 36, 13, 5)]);
+  f["1"] = G(58, [S1(gDiag(10, 56, 26, 70, 7)), ...stem(24, 14, 0, 70), S1(gRect(14, 0, 46, 5))]);
+  f["2"] = G(58, [S1(gBandC(29, 50, 27, 20, 20, 185, 12, 5, -3, -2)),
+    S1(gDiag(7, 47, 50, 4, 8)), S1(gRect(2, 0, 56, 6)), S1(gRect(52, 0, 56, 11))]);
+  f["3"] = G(60, [S1(gBandC(26, 52, 30, 18, 140, -70, 12, 5, 3, 0)),
+    S1(gBandC(26, 18, 32, 18, 90, -160, 12, 5, 3, 0))]);
+  f["4"] = G(58, [S1(gDiag(46, 70, 8, 20, t)), S1(gRect(4, 18, 54, 23)),
+    S1(gRect(38, 0, 52, 70)), S1(slab(45, 14, 0, 1))]);
+  f["5"] = G(58, [S1(gRect(4, 64, 54, 70)), S1(gRect(4, 36, 17, 66)),
+    S1(gRect(4, 32, 32, 36)), S1(gBandC(28, 18, 26, 18, 90, -160, 12, 5, 2, 0))]);
+  f["6"] = G(58, [oring(29, 20, 27, 21, 12, 5),
+    S1(gBandC(29, 46, 24, 22, 45, 215, 6, 6, 0, 0))]);
+  f["7"] = G(58, [S1(gRect(2, 64, 56, 70)),
+    S1([[2, 65], [11, 65], [9, 60], [4, 60]]), S1(gDiag(50, 66, 26, 0, t))]);
+  f["8"] = G(58, [oring(29, 51, 25, 19, 11, 5), oring(29, 19, 28, 20, 12, 5)]);
+  f["9"] = G(58, [oring(29, 50, 27, 21, 12, 5), S1(gRect(43, 14, 56, 54)),
+    S1(gBandC(29, 18, 27, 18, 0, -180, 6, 5, 0, 2))]);
+  f["."] = G(30, [S1(gEllipse(15, 6, 6.5, 6.5, 18))]);
+  f[","] = G(30, [S1(gEllipse(15, 6, 6.5, 6.5, 18)), S1(gDiag(19, 8, 9, -12, 7))]);
+  f[":"] = G(32, [S1(gEllipse(16, 52, 6.5, 6.5, 18)), S1(gEllipse(16, 14, 6.5, 6.5, 18))]);
+  f["-"] = G(38, [S1(gRect(4, 28, 34, 33))]);
+  f["•"] = G(32, [S1(gEllipse(16, 32, 8, 8, 20))]);
+  return f;
+}
+
+// ------------------------------------------------------------ text engine ---
+const KERN: Record<string, number> = {
+  "AV": -7, "VA": -7, "AW": -6, "WA": -6, "AY": -5, "YA": -5,
+  "TA": -6, "TO": -4, "TW": -5, "TY": -5, "LT": -4, "LY": -4,
+  "T,": -5, "Y,": -5, "A,": -4, "V,": -5, "W,": -5, "F,": -4, "P,": -4,
+  "T.": -5, "Y.": -5, "V.": -5, "W.": -5, "R,": -3, "O,": -3,
+  "17": -2, "7,": -3, "1,": -2, "L ": -2, "A ": -1,
 };
 
-function glyph(ch) { return G[ch] || G[" "]; }
-
-function textWidth(str, size, tracking) {
-  const s = size / 16;
-  let w = 0;
-  for (const ch of str) w += glyph(ch).a * s + (tracking || 0);
-  return w - (tracking || 0);
+function glyphAdvance(face: Face, ch: string): number {
+  const g = face[ch];
+  return g ? g.adv : 30;
 }
 
-function drawGlyph(ch, x, y, size, c) {
-  const g = glyph(ch);
-  const s = size / 16;
-  const polys = [];
-  for (const sh of g.sh) {
-    if (sh.p) {
-      polys.push({ pts: sh.p.map(([gx, gy]) => [x + gx * s, y + gy * s]), s: sh.h ? -1 : 1 });
-    } else {
-      strokePath(sh.l.map(([gx, gy]) => [x + gx * s, y + gy * s]), sh.w * s, c, !!sh.c);
+function textWidth(str: string, face: Face, size: number, tracking = 0): number {
+  let w = 0;
+  for (let i = 0; i < str.length; i++) {
+    w += glyphAdvance(face, str[i]);
+    if (i + 1 < str.length) {
+      w += tracking;
+      const k = KERN[str[i] + str[i + 1]];
+      if (k) w += k;
     }
   }
-  if (polys.length) fillPolys(polys, c);
+  return (w * size) / 100;
 }
 
-// Draw text; x,y = top-left of cap box. opts: align ('l','c','r'), tracking (px/char).
-function drawText(str, x, y, size, c, opts) {
-  const o = opts || {};
-  const tr = o.tracking || 0;
-  let xx = x;
-  if (o.align === "c") xx = x - textWidth(str, size, tr) / 2;
-  if (o.align === "r") xx = x - textWidth(str, size, tr);
-  const s = size / 16;
-  for (const ch of str) {
-    drawGlyph(ch, xx, y, size, c);
-    xx += glyph(ch).a * s + tr;
+// Draw one line. (x, baselineY) is the baseline start in 1024-space coords.
+// align: "left" | "center" | "right" relative to x.
+function drawText(str: string, x: number, baselineY: number, face: Face, size: number,
+  rgb: RGB, tracking = 0, align: "left" | "center" | "right" = "left"): void {
+  const w = textWidth(str, face, size, tracking);
+  let pen = align === "center" ? x - w / 2 : align === "right" ? x - w : x;
+  const k = size / 100;
+  for (let i = 0; i < str.length; i++) {
+    const ch = str[i];
+    const g = face[ch];
+    const adv = g ? g.adv : 30;
+    if (g) {
+      for (const shape of g.shapes) {
+        const mapped: Shape = shape.map((path) =>
+          path.map(([gx, gy]): Pt => [pen + gx * k, baselineY - gy * k]));
+        fillShape(mapped, rgb);
+      }
+    }
+    pen += adv * k;
+    if (i + 1 < str.length) {
+      pen += tracking * k;
+      const kern = KERN[ch + str[i + 1]];
+      if (kern) pen += kern * k;
+    }
   }
-  return xx;
 }
 
-// Text with a soft offset shadow for legibility over busy art.
-function drawTextShadow(str, x, y, size, c, shadow, opts) {
-  const o = opts || {};
-  drawText(str, x + size * 0.06, y + size * 0.07, size, shadow, o);
-  drawText(str, x, y, size, c, o);
-}
-
-// Greedy word wrap. Returns array of lines.
-function wrapText(str, size, maxW, tracking) {
-  const words = str.split(" ");
-  const lines = [];
-  let cur = "";
-  for (const w of words) {
-    const test = cur ? cur + " " + w : w;
-    if (textWidth(test, size, tracking || 0) <= maxW || !cur) cur = test;
-    else { lines.push(cur); cur = w; }
-  }
-  if (cur) lines.push(cur);
-  return lines;
-}
-
-// Fit one line to a max width by shrinking size.
-function fitSize(str, size, maxW, tracking) {
+// Fit one line into maxWidth by shrinking size from `size` downward.
+function fitText(str: string, x: number, baselineY: number, face: Face, size: number,
+  maxWidth: number, rgb: RGB, tracking = 0,
+  align: "left" | "center" | "right" = "left"): number {
   let s = size;
-  while (s > 6 && textWidth(str, s, tracking || 0) > maxW) s -= 0.5;
+  while (s > 4 && textWidth(str, face, s, tracking) > maxWidth) s -= 0.5;
+  drawText(str, x, baselineY, face, s, rgb, tracking, align);
   return s;
 }
 
-// ---------------------------------------------------------------- palette
-const NAVY = rgb("#0a1730"), NAVY2 = rgb("#0e2242"), NAVY3 = rgb("#081226");
-const GOLD = rgb("#d9b45b"), GOLDLT = rgb("#f0d48a"), GOLDDK = rgb("#a8873a");
-const CREAM = rgb("#f6efdd"), CREAM2 = rgb("#ece2c8"), INK = rgb("#1a2433");
-const SLATE = rgb("#4a5568"), FAINT = rgb("#8fa3c4");
-const RED = rgb("#b23a2e"), TEAL = rgb("#1e7a6d"), BLUE = rgb("#2b6cb0");
-const PURPLE = rgb("#7d4a9e"), BROWN = rgb("#6b4f2e"), GREEN = rgb("#3d8b4f");
-const WHITE = rgb("#ffffff");
+// ============================================================== PALETTE =====
+const NAVY = C(10, 30, 60);
+const NAVY_DK = C(7, 23, 49);
+const NAVY_PANEL = C(14, 40, 78);
+const NAVY_LINE = C(28, 58, 100);
+const GOLD = C(217, 164, 65);
+const GOLD_BRIGHT = C(232, 184, 75);
+const GOLD_PALE = C(240, 208, 137);
+const CREAM = C(245, 237, 216);
+const PAPER = C(247, 241, 226);
+const PAPER_DK = C(233, 224, 196);
+const INK = C(26, 36, 50);
+const SLATE = C(61, 74, 90);
+const RED = C(192, 57, 43);
+const WHITE = C(250, 248, 242);
 
-function diamond(cx, cy, r, c) {
-  fillPoly([[cx, cy - r], [cx + r, cy], [cx, cy + r], [cx - r, cy]], c);
+// ================================================================== MAP =====
+// Stylized continents as [lon, lat] outlines, projected into the map panel.
+const MAP_X0 = 12, MAP_X1 = 1012, MAP_Y0 = 162, MAP_Y1 = 270;
+function project(lon: number, lat: number): Pt {
+  return [MAP_X0 + ((lon + 180) / 360) * (MAP_X1 - MAP_X0),
+    MAP_Y0 + ((75 - lat) / 130) * (MAP_Y1 - MAP_Y0)];
 }
-
-// Layered flame: base at (cx, cy), height ~ s.
-function flame(cx, cy, s) {
-  const shape = (k, dy) => [[-0.95, 0], [-1, -0.35], [-0.6, -0.6], [-0.7, -1.05], [-0.3, -0.8], [-0.05, -1.55], [0.2, -0.95], [0.55, -1.25], [0.5, -0.7], [0.95, -0.4], [0.9, 0]]
-    .map(([x, y]) => [cx + x * s * k, cy + y * s * k + dy]);
-  fillPoly(shape(1, 0), rgb("#d9480f"));
-  fillPoly(shape(0.72, s * 0.06), rgb("#f07316"));
-  fillPoly(shape(0.48, s * 0.1), rgb("#f5a623"));
-  fillPoly(shape(0.26, s * 0.14), rgb("#ffe08a"));
-}
-function smoke(x, y, s) {
-  circle(x - s * 0.5, y - s * 0.2, s * 0.42, rgb("#8b939c"));
-  circle(x, y - s * 0.7, s * 0.55, rgb("#a7aeb6"));
-  circle(x + s * 0.55, y - s * 1.2, s * 0.45, rgb("#c2c7cc"));
-  circle(x + s * 0.1, y - s * 1.7, s * 0.38, rgb("#d4d8dc"));
-}
-function cloud(x, y, s, c) {
-  ellipse(x, y, s * 1.1, s * 0.42, c);
-  ellipse(x - s * 0.7, y + s * 0.1, s * 0.6, s * 0.3, c);
-  ellipse(x + s * 0.7, y + s * 0.08, s * 0.65, s * 0.32, c);
-  circle(x - s * 0.25, y - s * 0.22, s * 0.42, c);
-  circle(x + s * 0.35, y - s * 0.18, s * 0.36, c);
-}
-
-// Jet silhouette pointing right, centered at (cx, cy), length ~ s.
-function jet(cx, cy, s, c) {
-  const P = (pts) => pts.map(([x, y]) => [cx + x * s, cy + y * s]);
-  fillPoly(P([[1.7, 0], [0.4, -0.16], [-0.5, -0.14], [-1.4, 0.05], [-1.5, 0.18], [-0.4, 0.2], [0.4, 0.16]]), c);
-  fillPoly(P([[-0.1, -0.12], [-1.1, -0.78], [-1.38, -0.74], [-0.62, -0.04]]), c);
-  fillPoly(P([[-0.2, 0.14], [-0.9, 0.6], [-1.12, 0.55], [-0.55, 0.1]]), c);
-  fillPoly(P([[-1.0, -0.05], [-1.5, -0.52], [-1.68, -0.44], [-1.28, 0.08]]), c);
-  circle(cx + 0.95 * s, cy - 0.05 * s, 0.09 * s, rgb("#9fb6c8"));
-}
-
-// Airliner silhouette pointing right, small.
-function airliner(cx, cy, s, c) {
-  const P = (pts) => pts.map(([x, y]) => [cx + x * s, cy + y * s]);
-  fillPoly(P([[1.8, 0], [1.2, -0.16], [-0.8, -0.16], [-1.6, -0.02], [-1.8, 0.1], [-0.8, 0.18], [1.2, 0.18]]), c);
-  fillPoly(P([[0.1, -0.12], [-0.7, -0.62], [-0.95, -0.58], [-0.35, -0.08]]), c);
-  fillPoly(P([[-0.1, 0.14], [-0.6, 0.5], [-0.8, 0.46], [-0.4, 0.12]]), c);
-  fillPoly(P([[-1.3, -0.1], [-1.7, -0.5], [-1.88, -0.44], [-1.55, -0.02]]), c);
-}
-
-// ---------------------------------------------------------------- world map
-// Coastlines as [lon, lat] point lists (own approximations, equirectangular).
-const LAND = [
-  [[-168, 66], [-165, 60], [-158, 58], [-152, 60], [-140, 60], [-135, 57], [-130, 54], [-125, 49], [-124, 42], [-120, 34], [-114, 30], [-110, 24], [-105, 20], [-97, 16], [-92, 15], [-86, 13], [-83, 9], [-80, 8], [-77, 7], [-80, 9], [-83, 15], [-88, 16], [-87, 21], [-90, 21], [-97, 26], [-94, 29], [-89, 30], [-84, 30], [-81, 26], [-80, 32], [-76, 35], [-74, 40], [-70, 42], [-68, 44], [-65, 45], [-60, 46], [-55, 47], [-60, 52], [-65, 55], [-68, 58], [-72, 62], [-78, 62], [-85, 66], [-92, 66], [-95, 69], [-110, 68], [-125, 70], [-140, 70], [-155, 71]],
-  [[-58, 64], [-52, 60], [-43, 60], [-40, 64], [-32, 68], [-22, 70], [-20, 76], [-30, 80], [-45, 82], [-60, 80], [-70, 77], [-62, 72]],
-  [[-77, 7], [-72, 11], [-64, 10], [-60, 8], [-52, 5], [-50, 0], [-44, -3], [-35, -8], [-38, -15], [-40, -22], [-48, -27], [-53, -33], [-58, -38], [-62, -41], [-65, -45], [-68, -50], [-69, -52], [-73, -53], [-73, -44], [-72, -36], [-70, -23], [-70, -18], [-77, -12], [-81, -6], [-80, -1]],
-  [[-17, 15], [-10, 28], [-5, 35], [0, 36], [10, 37], [20, 32], [30, 31], [34, 28], [35, 24], [37, 22], [40, 15], [43, 12], [48, 11], [51, 10], [46, 5], [41, -2], [40, -8], [39, -15], [36, -20], [33, -26], [28, -33], [20, -35], [17, -32], [14, -25], [12, -18], [13, -10], [9, -1], [9, 4], [-8, 4], [-13, 8]],
-  [[44, -16], [47, -15], [50, -17], [48, -22], [45, -25], [43, -21]],
-  [[-10, 36], [-9, 43], [-2, 48], [0, 51], [5, 53], [8, 55], [10, 58], [13, 56], [18, 56], [21, 55], [24, 58], [28, 60], [30, 62], [35, 65], [40, 67], [45, 68], [55, 69], [65, 69], [70, 72], [80, 73], [90, 75], [100, 77], [110, 74], [120, 73], [130, 72], [140, 72], [150, 70], [158, 66], [162, 64], [170, 66], [178, 65], [178, 62], [170, 60], [162, 58], [158, 52], [156, 50], [150, 46], [142, 45], [140, 40], [135, 35], [130, 33], [126, 38], [122, 38], [120, 32], [118, 25], [114, 22], [108, 18], [105, 10], [103, 7], [100, 6], [98, 10], [94, 17], [91, 22], [88, 22], [86, 20], [80, 16], [77, 8], [74, 12], [72, 20], [68, 23], [66, 25], [62, 25], [58, 24], [54, 26], [52, 28], [50, 30], [48, 30], [44, 29], [40, 32], [36, 36], [33, 36], [30, 36], [26, 38], [23, 36], [19, 40], [16, 38], [12, 44], [8, 44], [3, 43], [-2, 37], [-6, 36]],
-  [[-5, 50], [-3, 53], [-5, 56], [-3, 58], [-1, 57], [0, 53], [1, 51]],
-  [[130, 31], [133, 34], [137, 35], [140, 36], [141, 40], [143, 43], [141, 45], [139, 38], [136, 34], [132, 33]],
-  [[95, 5], [98, 2], [101, -1], [104, -3], [106, -6], [103, -5], [100, -1], [96, 2]],
-  [[105, -6], [110, -7], [114, -8], [118, -9], [114, -9], [108, -8], [105, -7]],
-  [[109, 1], [113, 3], [117, 6], [119, 2], [117, -2], [113, -3], [110, -1]],
-  [[131, -1], [136, -2], [141, -3], [146, -6], [141, -8], [136, -8], [132, -6]],
-  [[113, -22], [114, -30], [118, -35], [124, -33], [129, -32], [132, -32], [135, -35], [138, -35], [140, -38], [145, -38], [150, -37], [153, -32], [153, -27], [150, -23], [146, -19], [142, -11], [137, -12], [135, -15], [132, -12], [130, -13], [126, -14], [122, -17], [117, -20]],
-  [[167, -46], [172, -43], [175, -38], [178, -38], [174, -41], [170, -44]],
+const CONTINENTS: Array<Array<[number, number]>> = [
+  // North America
+  [[-168, 66], [-158, 71], [-140, 70], [-128, 70], [-115, 73], [-95, 72], [-85, 70], [-80, 73],
+   [-75, 72], [-65, 62], [-55, 52], [-60, 46], [-65, 44], [-70, 42], [-74, 40], [-76, 35],
+   [-80, 32], [-81, 26], [-84, 30], [-88, 29], [-94, 29], [-97, 26], [-97, 22], [-94, 18],
+   [-90, 16], [-86, 13], [-82, 9], [-79, 9], [-83, 15], [-90, 14], [-95, 16], [-100, 18],
+   [-105, 20], [-110, 23], [-114, 28], [-120, 34], [-124, 40], [-124, 48], [-130, 54],
+   [-135, 58], [-150, 61], [-162, 58]],
+  // Greenland
+  [[-58, 64], [-45, 60], [-40, 65], [-30, 68], [-22, 70], [-30, 76], [-50, 78], [-60, 74]],
+  // South America
+  [[-79, 9], [-72, 11], [-64, 10], [-58, 8], [-52, 5], [-50, 0], [-44, -3], [-35, -8],
+   [-40, -20], [-48, -27], [-55, -33], [-62, -39], [-65, -45], [-70, -50], [-74, -53],
+   [-72, -42], [-72, -30], [-70, -20], [-77, -12], [-80, -6], [-81, 0]],
+  // Africa
+  [[-17, 15], [-10, 30], [0, 35], [10, 37], [20, 32], [32, 31], [35, 28], [38, 22],
+   [43, 12], [48, 11], [51, 12], [44, 2], [40, -8], [38, -18], [35, -24], [30, -30],
+   [20, -35], [17, -32], [14, -22], [12, -12], [9, -2], [9, 4], [-8, 5], [-13, 8]],
+  // Madagascar
+  [[44, -16], [47, -20], [50, -25], [47, -25], [44, -20]],
+  // Eurasia
+  [[-10, 36], [-9, 43], [-2, 48], [0, 51], [5, 53], [8, 55], [10, 58], [13, 56], [18, 56],
+   [21, 55], [24, 58], [28, 60], [30, 62], [35, 65], [40, 67], [50, 69], [60, 70], [70, 72],
+   [80, 73], [90, 75], [100, 77], [110, 76], [120, 73], [130, 72], [140, 72], [150, 70],
+   [158, 66], [162, 62], [158, 58], [155, 52], [150, 45], [142, 42], [140, 38], [135, 35],
+   [130, 33], [126, 38], [122, 38], [120, 32], [122, 28], [118, 25], [114, 22], [109, 20],
+   [105, 10], [103, 2], [100, 6], [98, 10], [94, 17], [91, 22], [88, 22], [85, 19], [80, 15],
+   [77, 8], [75, 12], [72, 20], [68, 23], [66, 25], [61, 25], [57, 27], [54, 27], [52, 26],
+   [50, 29], [48, 30], [44, 29], [40, 31], [36, 36], [30, 36], [27, 37], [23, 36], [19, 40],
+   [15, 40], [12, 42], [8, 38], [3, 37], [-2, 36]],
+  // United Kingdom
+  [[-5, 50], [-3, 53], [-5, 56], [-3, 58], [-1, 57], [0, 53]],
+  // Japan
+  [[130, 31], [133, 34], [137, 35], [140, 36], [142, 40], [144, 44], [141, 45], [139, 39],
+   [135, 34], [131, 33]],
+  // Indonesia
+  [[95, 5], [100, 0], [105, -5], [110, -7], [115, -8], [120, -10], [125, -9], [131, -3],
+   [136, -2], [141, -4], [138, -8], [131, -8], [125, -10], [118, -10], [112, -8], [106, -6],
+   [101, 0]],
+  // Australia
+  [[113, -22], [114, -30], [118, -35], [124, -33], [129, -32], [132, -32], [135, -35],
+   [138, -35], [140, -38], [145, -38], [147, -39], [150, -37], [153, -32], [153, -27],
+   [150, -23], [146, -19], [142, -11], [137, -12], [135, -15], [132, -12], [130, -12],
+   [126, -14], [122, -17], [117, -20]],
+  // New Zealand
+  [[167, -45], [170, -43], [174, -41], [178, -38], [176, -40], [172, -43], [168, -46]],
 ];
-const AFRICA = LAND[3];
 
-function drawMap(x, y, w, h) {
-  vgrad(x, y, w, h, rgb("#0e2547"), rgb("#0a1a33"));
-  const mx = x + 8, my = y + 6, mw = w - 16, mh = h - 12;
-  const proj = (lon, lat) => [mx + (lon + 170) / 360 * mw, my + (78 - lat) / 136 * mh];
-  // Graticule.
-  const gridC = rgb("#1d3a63");
-  for (let lon = -150; lon <= 180; lon += 30) {
-    const [gx] = proj(lon, 0);
-    vline(gx, my, mh, gridC, 0.7);
-  }
-  for (let lat = 60; lat >= -45; lat -= 30) {
-    const [, gy] = proj(0, lat);
-    hline(mx, gy, mw, gridC, 0.7);
-  }
-  // Continents: gold land with a darker edge.
-  for (const poly of LAND) {
-    const pts = poly.map(([lo, la]) => proj(lo, la));
-    fillPoly(pts, rgb("#c2a15c"));
-    strokePath(pts, 1, rgb("#8a6f35"), true);
-  }
-  // Story dots + labels.
-  const dots = [
-    ["WASHINGTON", -77, 39, -7, -4, "r"], ["KYIV", 30, 50, -5, -11, "r"],
-    ["KERCH", 36, 45, -7, 3, "r"], ["HORMUZ", 56, 26, 7, -6, "l"],
-    ["ADEN", 45, 13, 7, 11, "l"], ["KIGALI", 30, -2, -7, 13, "r"],
-    ["SHENZHEN", 114, 22, 0, -13, "c"], ["MANILA", 121, 15, 8, 1, "l"],
-    ["TOKYO", 140, 36, 7, -4, "l"], ["ANDHRA", 80, 16, 0, 13, "c"],
+// City dots: [name, lon, lat, dot nudge, label anchor x, label baseline y, align]
+interface City { name: string; lon: number; lat: number; dx: number; dy: number;
+  lx: number; ly: number; align: "left" | "center" | "right"; }
+const CITIES: City[] = [
+  { name: "WASHINGTON", lon: -77, lat: 39, dx: 0, dy: 0, lx: 286, ly: 186, align: "right" },
+  { name: "KYIV", lon: 30.5, lat: 50.4, dx: -9, dy: -2, lx: 578, ly: 176, align: "right" },
+  { name: "KERCH", lon: 36.7, lat: 45.3, dx: -8, dy: 3, lx: 600, ly: 208, align: "left" },
+  { name: "HORMUZ", lon: 56.5, lat: 27, dx: 0, dy: 0, lx: 678, ly: 194, align: "left" },
+  { name: "ADEN", lon: 45, lat: 12.8, dx: 0, dy: 0, lx: 637, ly: 232, align: "center" },
+  { name: "KIGALI", lon: 30, lat: -1.9, dx: 0, dy: 0, lx: 584, ly: 242, align: "right" },
+  { name: "SHENZHEN", lon: 114, lat: 22.5, dx: 0, dy: 0, lx: 818, ly: 194, align: "right" },
+  { name: "MANILA", lon: 121, lat: 14.6, dx: 0, dy: 0, lx: 856, ly: 228, align: "left" },
+  { name: "TOKYO", lon: 139.7, lat: 35.7, dx: 0, dy: 0, lx: 909, ly: 199, align: "left" },
+  { name: "ANDHRA", lon: 80, lat: 16, dx: 0, dy: 0, lx: 734, ly: 228, align: "center" },
+];
+
+// ======================================================== lead illustrations =
+// Each draws inside (x, y, w, h). Large central subjects, no element
+// overlapping another's key feature.
+function flame(cx: number, cy: number, s: number): void {
+  // Leaning flame silhouette: pointed tip, wavy sides, flat base.
+  // Three nested layers (red / orange / yellow) share the outline.
+  const outline: Path = [
+    [-14, 2], [-13, -6], [-10, -13], [-6, -19], [-1, -27], [3, -31],
+    [5, -24], [4, -17], [8, -11], [12, -6], [14, 0], [8, 3], [-8, 3],
   ];
-  for (const [name, lo, la, dx, dy, al] of dots) {
-    const [px, py] = proj(lo, la);
-    circle(px, py, 4.2, WHITE);
-    circle(px, py, 2.7, RED);
-    drawTextShadow(name, px + dx, py + dy, 10, WHITE, NAVY3, { align: al === "c" ? "c" : al === "r" ? "r" : "l", tracking: 0.5 });
-  }
-  // Tag.
-  fillRect(x + 8, y + 6, 118, 17, GOLD);
-  drawText("WHERE IT HAPPENED", x + 14, y + 10, 9.5, NAVY, { tracking: 0.5 });
-}
-
-// ---------------------------------------------------------------- scenes
-// Each draws inside (x, y, w, h); clip is set by the caller.
-function sceneBridge(x, y, w, h) {
-  vgrad(x, y, w, h, rgb("#f7c873"), rgb("#f2e3c2"));
-  circle(x + w * 0.9, y + h * 0.2, 13, rgb("#fff3cf"));
-  // Sea.
-  fillRect(x, y + h * 0.62, w, h * 0.38, rgb("#3f6d8e"));
-  for (let i = 0; i < 7; i++) {
-    const wy = y + h * 0.68 + i * 5;
-    dashedLine(x + 8 + (i % 2) * 14, wy, x + w - 10, wy, 1.2, rgb("#7fa3bd"), 10, 8);
-  }
-  const deckY = y + h * 0.58;
-  const gapL = x + w * 0.44, gapR = x + w * 0.58;
-  // Towers + cables.
-  const tower = (tx) => {
-    fillRect(tx - 3, deckY - 34, 6, 34 + h * 0.1, rgb("#5a4632"));
-    fillRect(tx - 6, deckY - 34, 12, 4, rgb("#5a4632"));
+  const layer = (scale: number, dx: number, dy: number, rgb: RGB): void => {
+    polyShape(outline.map(([px, py]): Pt => [cx + dx + px * scale * s, cy + dy + py * scale * s]), rgb);
   };
-  tower(x + w * 0.22); tower(x + w * 0.78);
-  strokePath(quad([x + w * 0.22, deckY - 32], [x + w * 0.33, deckY - 8], [gapL, deckY - 2], 10), 1.4, rgb("#5a4632"), false);
-  strokePath(quad([x + w * 0.78, deckY - 32], [x + w * 0.67, deckY - 8], [gapR, deckY - 2], 10), 1.4, rgb("#5a4632"), false);
-  // Deck segments + broken ends.
-  fillRect(x, deckY - 4, gapL - x, 5, rgb("#6b543a"));
-  fillRect(gapR, deckY - 4, x + w - gapR, 5, rgb("#6b543a"));
-  fillPoly([[gapL, deckY - 4], [gapL + 7, deckY - 1], [gapL + 3, deckY + 2], [gapL - 2, deckY + 1]], rgb("#6b543a"));
-  fillPoly([[gapR, deckY - 4], [gapR - 7, deckY - 1], [gapR - 3, deckY + 2], [gapR + 2, deckY + 1]], rgb("#6b543a"));
-  // Fallen span in the water, tilted.
-  fillPoly([[gapL + 2, deckY + 14], [gapR - 4, deckY + 22], [gapR - 8, deckY + 27], [gapL - 2, deckY + 19]], rgb("#54432f"));
-  // Fire + smoke at the break.
-  flame((gapL + gapR) / 2, deckY - 2, 26);
-  smoke((gapL + gapR) / 2 + 8, deckY - 26, 9);
-  // Small boat.
-  const bx = x + w * 0.16, by = y + h * 0.82;
-  fillPoly([[bx - 16, by], [bx + 16, by], [bx + 11, by + 7], [bx - 11, by + 7]], rgb("#7e2f26"));
-  fillRect(bx - 5, by - 7, 10, 7, rgb("#e8e0cc"));
+  layer(1.0, 0, 0, C(198, 52, 30));
+  layer(0.66, -1 * s, 2 * s, C(232, 110, 30));
+  layer(0.38, -1 * s, 4 * s, C(244, 190, 60));
 }
 
-function sceneTanker(x, y, w, h) {
-  vgrad(x, y, w, h, rgb("#bfd9e8"), rgb("#f0dfba"));
-  circle(x + w * 0.82, y + h * 0.2, 11, rgb("#fff6da"));
-  fillRect(x, y + h * 0.6, w, h * 0.4, rgb("#2e5f7e"));
-  for (let i = 0; i < 5; i++) {
-    const wy = y + h * 0.66 + i * 6;
-    dashedLine(x + 6 + (i % 2) * 18, wy, x + w - 8, wy, 1.2, rgb("#6f9ab5"), 12, 9);
+function drawBridge(x: number, y: number, w: number, h: number): void {
+  rectGradient(x, y, x + w, y + h, C(242, 217, 140), C(232, 199, 120));
+  // Sun, far right and clear of the tower.
+  circleFill(x + w - 26, y + 15, 11, C(250, 240, 200));
+  circleFill(x + w - 26, y + 15, 8, C(252, 246, 220));
+  const waterY = y + h * 0.66;
+  rectFill(x, waterY, x + w, y + h, C(74, 127, 165));
+  for (let i = 0; i < 9; i++) {
+    lineDraw(x + 8 + i * 34, waterY + 8 + (i % 3) * 5, x + 26 + i * 34, waterY + 8 + (i % 3) * 5, 1.5, C(140, 180, 205));
   }
-  // Distant warship silhouette.
-  const wx = x + w * 0.1, wy = y + h * 0.56;
-  fillPoly([[wx - 30, wy], [wx + 30, wy], [wx + 24, wy + 6], [wx - 24, wy + 6]], rgb("#5b6b7a"));
-  fillRect(wx - 8, wy - 9, 14, 9, rgb("#5b6b7a"));
-  line(wx + 2, wy - 9, wx + 2, wy - 16, 1.5, rgb("#5b6b7a"));
-  // Tanker hull.
-  const hy = y + h * 0.6;
-  fillPoly([[x + 26, hy - 4], [x + w - 30, hy - 4], [x + w - 12, hy + 16], [x + 40, hy + 16], [x + 26, hy + 8]], rgb("#7e2f26"));
-  fillRect(x + 26, hy - 7, w - 56, 4, rgb("#5e211c"));
-  // Superstructure + funnel.
-  fillRect(x + w - 78, hy - 26, 30, 20, rgb("#e8e0cc"));
-  for (let i = 0; i < 3; i++) fillRect(x + w - 72 + i * 9, hy - 21, 5, 5, rgb("#3a4a5a"));
-  fillRect(x + w - 48, hy - 30, 12, 24, rgb("#2e2a26"));
-  smoke(x + w - 42, hy - 32, 8);
-  // Deck fire, layered.
-  flame(x + w * 0.42, hy - 6, 30);
-  smoke(x + w * 0.42 + 10, hy - 34, 8);
-  // Naval mine in the foreground water.
-  const mxp = x + w * 0.82, myp = y + h * 0.86;
-  for (let a = 0; a < 8; a++) {
-    const t = a / 8 * Math.PI * 2;
-    line(mxp, myp, mxp + Math.cos(t) * 11, myp + Math.sin(t) * 11, 1.6, rgb("#1c222c"));
-  }
-  circle(mxp, myp, 7, rgb("#1c222c"));
-  circle(mxp - 2, myp - 2, 2, rgb("#4a5568"));
-  ellipse(mxp, myp + 9, 14, 2.5, rgb("#7fa3bd"));
+  // Bridge: left deck + broken section dipping into the strait.
+  const deckY = y + h * 0.5;
+  const towerX = x + w * 0.3;
+  rectFill(x, deckY, x + w * 0.52, deckY + 5, C(90, 70, 55));
+  lineDraw(x + w * 0.52, deckY + 2, x + w * 0.68, waterY - 2, 5, C(90, 70, 55)); // fallen span
+  rectFill(x + w * 0.72, deckY, x + w, deckY + 5, C(90, 70, 55));
+  // Tower (left of the fire, clear of the sun): twin posts + X brace.
+  rectFill(towerX - 5, y + 10, towerX - 1, deckY, C(70, 55, 42));
+  rectFill(towerX + 1, y + 10, towerX + 5, deckY, C(70, 55, 42));
+  rectFill(towerX - 10, y + 14, towerX + 10, y + 18, C(70, 55, 42));
+  lineDraw(towerX - 4, y + 20, towerX + 4, deckY - 4, 1.6, C(70, 55, 42));
+  lineDraw(towerX + 4, y + 20, towerX - 4, deckY - 4, 1.6, C(70, 55, 42));
+  lineDraw(towerX, y + 12, x + 6, deckY, 1.5, C(110, 90, 70));
+  lineDraw(towerX, y + 12, x + w * 0.5, deckY, 1.5, C(110, 90, 70));
+  // Fire at the break (sized to stay inside the panel).
+  flame(x + w * 0.58, deckY - 6, 0.7);
+  // Small boat, far left.
+  polyShape([[x + 14, waterY + 8], [x + 40, waterY + 8], [x + 34, waterY + 16], [x + 20, waterY + 16]], C(160, 50, 40));
+  rectFill(x + 24, waterY + 2, x + 32, waterY + 8, C(240, 235, 220));
 }
 
-function sceneShenzhen(x, y, w, h) {
-  vgrad(x, y, w, h, rgb("#6b3a6e"), rgb("#e8804a"));
-  circle(x + w * 0.3, y + h * 0.34, 12, rgb("#ffd98a"));
+function drawTanker(x: number, y: number, w: number, h: number): void {
+  rectGradient(x, y, x + w, y + h, C(220, 232, 236), C(190, 208, 216));
+  const waterY = y + h * 0.62;
+  rectFill(x, waterY, x + w, y + h, C(62, 110, 142));
+  for (let i = 0; i < 8; i++) {
+    lineDraw(x + 10 + i * 38, waterY + 7 + (i % 2) * 6, x + 28 + i * 38, waterY + 7 + (i % 2) * 6, 1.5, C(130, 175, 200));
+  }
+  // Distant ship silhouette, far left.
+  rectFill(x + 8, waterY - 8, x + 44, waterY - 2, C(90, 105, 115));
+  rectFill(x + 28, waterY - 14, x + 36, waterY - 8, C(90, 105, 115));
+  // Tanker hull: long dark-red trapezoid, deck structures right.
+  const hullY = waterY - 12;
+  polyShape([[x + w * 0.12, hullY], [x + w * 0.88, hullY], [x + w * 0.82, waterY + 8],
+    [x + w * 0.18, waterY + 8]], C(148, 42, 34));
+  rectFill(x + w * 0.12, hullY - 3, x + w * 0.88, hullY, C(120, 34, 28));
+  rectFill(x + w * 0.74, hullY - 18, x + w * 0.86, hullY - 3, C(238, 236, 228));
+  rectFill(x + w * 0.78, hullY - 24, x + w * 0.83, hullY - 18, C(40, 40, 44));
+  // Fire amidships (sized to stay inside the panel).
+  flame(x + w * 0.45, hullY - 4, 0.6);
+  // Mines in the water, clear of the hull.
+  for (const [mx, my] of [[0.2, 0.86], [0.62, 0.9]] as const) {
+    const px = x + w * mx, py = y + h * my;
+    circleFill(px, py, 4, C(30, 30, 32));
+    for (let a = 0; a < 8; a++) {
+      const r = (a / 8) * Math.PI * 2;
+      lineDraw(px, py, px + 7 * Math.cos(r), py + 7 * Math.sin(r), 1.2, C(30, 30, 32));
+    }
+  }
+}
+
+function drawShenzhen(x: number, y: number, w: number, h: number): void {
+  rectGradient(x, y, x + w, y + h, C(107, 74, 138), C(232, 130, 63));
+  // Sun sits in the open sky above the low mid-block, clear of all towers.
+  circleFill(x + w * 0.40, y + 13, 10, C(248, 214, 150));
   // Skyline silhouettes with lit windows.
-  const towers = [[0, 0.52, 0.13], [0.12, 0.38, 0.1], [0.23, 0.6, 0.12], [0.36, 0.3, 0.09], [0.46, 0.48, 0.13], [0.6, 0.36, 0.1], [0.71, 0.55, 0.12], [0.84, 0.42, 0.16]];
-  for (const [fx, top, fw] of towers) {
-    const bx = x + fx * w, bw = fw * w, by = y + top * h, bh = h - top * h;
-    fillRect(bx, by, bw, bh, rgb("#2a1e3a"));
-    for (let wy = by + 6; wy < y + h - 6; wy += 9)
-      for (let wx = bx + 5; wx < bx + bw - 5; wx += 9)
-        if ((Math.floor(wx) + Math.floor(wy)) % 3 === 0) fillRect(wx, wy, 3, 4, rgb("#f0d48a"));
-  }
-  fillRect(x, y + h - 8, w, 8, rgb("#1c1426"));
-  // Birds.
-  for (const [bx, by] of [[0.2, 0.16], [0.28, 0.1], [0.55, 0.12]]) {
-    const px = x + bx * w, py = y + by * h;
-    strokePath([[px - 5, py], [px, py - 3], [px + 5, py]], 1.3, rgb("#2a1e3a"), false);
-  }
-  // Three flags on poles.
-  const flag = (fx, kind) => {
-    const px = x + fx * w, py = y + h * 0.52;
-    line(px, py, px, py - 34, 1.6, rgb("#e8e0cc"));
-    const fw = 22, fh = 13, fx0 = px + 1, fy0 = py - 34;
-    if (kind === 0) { // US: stripes + canton
-      fillRect(fx0, fy0, fw, fh, rgb("#f2ede0"));
-      for (let i = 0; i < 4; i++) fillRect(fx0, fy0 + i * 3.4, fw, 1.7, rgb("#b23a2e"));
-      fillRect(fx0, fy0, 9, 7, rgb("#2b4a7a"));
-    } else if (kind === 1) { // China: red + stars
-      fillRect(fx0, fy0, fw, fh, rgb("#c0392b"));
-      diamond(fx0 + 5, fy0 + 4, 2.4, rgb("#f0d48a"));
-      circle(fx0 + 11, fy0 + 3, 1.1, rgb("#f0d48a"));
-      circle(fx0 + 13, fy0 + 6, 1.1, rgb("#f0d48a"));
-    } else { // Russia: white / blue / red
-      fillRect(fx0, fy0, fw, fh / 3, rgb("#f2ede0"));
-      fillRect(fx0, fy0 + fh / 3, fw, fh / 3, rgb("#2b6cb0"));
-      fillRect(fx0, fy0 + 2 * fh / 3, fw, fh / 3, rgb("#c0392b"));
+  const base = y + h;
+  const towers: Array<[number, number, number]> = [
+    [0.02, 0.52, 0.16], [0.19, 0.68, 0.13], [0.33, 0.42, 0.15], [0.49, 0.74, 0.14],
+    [0.64, 0.55, 0.15], [0.80, 0.64, 0.18],
+  ];
+  for (const [fx, fh, fw] of towers) {
+    const tx = x + w * fx, tw = w * fw, ty = base - h * fh;
+    rectFill(tx, ty, tx + tw, base, C(38, 30, 58));
+    for (let wy = ty + 6; wy < base - 6; wy += 9) {
+      for (let wx = tx + 5; wx < tx + tw - 4; wx += 9) {
+        if (((wx * 7 + wy * 13) % 5) < 2) rectFill(wx, wy, wx + 3, wy + 3.5, C(240, 200, 110));
+      }
     }
-  };
-  flag(0.62, 0); flag(0.74, 1); flag(0.86, 2);
+  }
+  // Three flags on the tallest tower (center), poles clear of the sun.
+  const poleX = x + w * 0.53, poleTop = base - h * 0.74 - 14;
+  const flagCols: Array<[RGB, RGB, RGB]> = [
+    [C(200, 60, 60), C(250, 245, 235), C(60, 80, 160)],
+    [C(200, 40, 40), C(240, 200, 60), C(200, 40, 40)],
+    [C(245, 245, 240), C(60, 100, 200), C(200, 50, 50)],
+  ];
+  for (let i = 0; i < 3; i++) {
+    const px = poleX + i * 14;
+    lineDraw(px, poleTop, px, poleTop + 16, 1.2, C(240, 240, 235));
+    for (let s = 0; s < 3; s++) {
+      rectFill(px + 1, poleTop + s * 3, px + 11, poleTop + s * 3 + 3, flagCols[i][s]);
+    }
+  }
 }
 
-function sceneJets(x, y, w, h) {
-  vgrad(x, y, w, h, rgb("#8fc3e8"), rgb("#e8f2f8"));
-  cloud(x + w * 0.2, y + h * 0.24, 16, rgb("#ffffff"));
-  cloud(x + w * 0.62, y + h * 0.16, 12, rgb("#f4f8fb"));
-  cloud(x + w * 0.85, y + h * 0.42, 14, rgb("#eef4f8"));
-  // Contrails: dashed curves trailing the jets.
-  const trail = (pts) => {
-    for (let i = 0; i < pts.length - 1; i++) {
-      if (i % 2 === 0) line(pts[i][0], pts[i][1], pts[i + 1][0], pts[i + 1][1], 1.6, rgb("#ffffff"));
-    }
+function drawJets(x: number, y: number, w: number, h: number): void {
+  rectGradient(x, y, x + w, y + h, C(127, 178, 224), C(200, 226, 242));
+  // Clouds.
+  for (const [cx, cy, s] of [[0.2, 0.2, 1], [0.55, 0.12, 0.8], [0.82, 0.3, 0.9]] as const) {
+    const px = x + w * cx, py = y + h * cy;
+    ellipseFill(px, py, 20 * s, 7 * s, C(250, 251, 252));
+    ellipseFill(px - 12 * s, py + 3 * s, 12 * s, 5 * s, C(250, 251, 252));
+    ellipseFill(px + 13 * s, py + 3 * s, 12 * s, 5 * s, C(250, 251, 252));
+  }
+  const seaY = y + h * 0.88;
+  rectFill(x, seaY, x + w, y + h, C(62, 110, 142));
+  // Island with palm, bottom left.
+  ellipseFill(x + w * 0.14, seaY + 2, 34, 7, C(120, 110, 70));
+  lineDraw(x + w * 0.14, seaY, x + w * 0.14 + 4, seaY - 20, 2.5, C(110, 80, 50));
+  for (let a = 0; a < 5; a++) {
+    const r = Math.PI * (0.15 + a * 0.18);
+    lineDraw(x + w * 0.14 + 4, seaY - 20, x + w * 0.14 + 4 + 15 * Math.cos(r), seaY - 20 - 8 * Math.sin(r), 2, C(60, 130, 70));
+  }
+  // Jet silhouette: thick fuselage + swept wings + tail, flying right.
+  const jet = (jx: number, jy: number, s: number): void => {
+    polyShape([[jx - 28 * s, jy], [jx + 22 * s, jy - 4.5 * s], [jx + 32 * s, jy],
+      [jx + 22 * s, jy + 4.5 * s], [jx - 28 * s, jy + 3 * s]], C(52, 58, 66));
+    polyShape([[jx - 2 * s, jy], [jx + 8 * s, jy - 17 * s], [jx + 15 * s, jy - 17 * s],
+      [jx + 11 * s, jy]], C(52, 58, 66));
+    polyShape([[jx - 22 * s, jy], [jx - 15 * s, jy - 11 * s], [jx - 9 * s, jy - 11 * s],
+      [jx - 13 * s, jy]], C(52, 58, 66));
   };
-  trail(quad([x + w * 0.08, y + h * 0.34], [x + w * 0.24, y + h * 0.42], [x + w * 0.4, y + h * 0.3], 14));
-  trail(quad([x + w * 0.3, y + h * 0.62], [x + w * 0.48, y + h * 0.7], [x + w * 0.64, y + h * 0.58], 14));
-  jet(x + w * 0.44, y + h * 0.3, 15, rgb("#2b3442"));
-  jet(x + w * 0.68, y + h * 0.58, 18, rgb("#232c38"));
-  // Sea + island below.
-  fillRect(x, y + h * 0.8, w, h * 0.2, rgb("#4a7fa5"));
-  fillPoly([[x + w * 0.12, y + h * 0.8], [x + w * 0.3, y + h * 0.8], [x + w * 0.26, y + h * 0.72], [x + w * 0.17, y + h * 0.7]], rgb("#4a7a4e"));
-  line(x + w * 0.21, y + h * 0.72, x + w * 0.21, y + h * 0.62, 1.4, rgb("#5a4632"));
-  ellipse(x + w * 0.21, y + h * 0.6, 7, 2.5, rgb("#3d6b3f"));
-}
-
-function scenePentagon(x, y, w, h) {
-  fillRect(x, y, w, h, rgb("#e9e2cf"));
-  const gc = rgb("#ddd2b6");
-  for (let gx = x + 12; gx < x + w; gx += 14) vline(gx, y, h, gc, 0.6);
-  for (let gy = y + 12; gy < y + h; gy += 14) hline(x, gy, w, gc, 0.6);
-  // Pentagon building.
-  const cx = x + w * 0.34, cy = y + h * 0.52, R = 34;
-  const ring = (r, rot) => {
-    const pts = [];
-    for (let i = 0; i < 5; i++) {
-      const a = rot + i / 5 * Math.PI * 2;
-      pts.push([cx + Math.cos(a) * r, cy + Math.sin(a) * r]);
-    }
-    return pts;
-  };
-  fillPoly(ring(R, -Math.PI / 2), rgb("#46536a"));
-  fillPoly(ring(R * 0.55, -Math.PI / 2), rgb("#e9e2cf"));
+  jet(x + w * 0.32, y + h * 0.42, 1.15);
+  jet(x + w * 0.68, y + h * 0.62, 1.0);
+  // Contrails, dashed, behind the lead jet.
   for (let i = 0; i < 5; i++) {
-    const a = -Math.PI / 2 + i / 5 * Math.PI * 2;
-    line(cx + Math.cos(a) * R * 0.55, cy + Math.sin(a) * R * 0.55, cx + Math.cos(a) * R, cy + Math.sin(a) * R, 1.2, rgb("#5b6a84"));
+    lineDraw(x + w * 0.32 - 34 - i * 12, y + h * 0.42 + 1, x + w * 0.32 - 26 - i * 12, y + h * 0.42 + 1, 1.5, C(245, 248, 250));
   }
-  // Falling bar chart.
-  const bx = x + w * 0.62, by = y + h * 0.78, bw = 13;
-  const heights = [44, 34, 24, 13];
+}
+
+function drawPentagon(x: number, y: number, w: number, h: number): void {
+  rectFill(x, y, x + w, y + h, C(239, 230, 204));
+  for (let gx = x + 14; gx < x + w; gx += 14) lineDraw(gx, y, gx, y + h, 0.7, C(222, 212, 182));
+  for (let gy = y + 14; gy < y + h; gy += 14) lineDraw(x, gy, x + w, gy, 0.7, C(222, 212, 182));
+  // Big navy pentagon, left.
+  const cx = x + w * 0.26, cy = y + h * 0.52, r = h * 0.38;
+  const pent: Path = [];
+  for (let i = 0; i < 5; i++) {
+    const a = -Math.PI / 2 + (i / 5) * Math.PI * 2;
+    pent.push([cx + r * Math.cos(a), cy + r * Math.sin(a)]);
+  }
+  polyShape(pent, C(46, 64, 96));
+  const inner: Path = [];
+  for (let i = 0; i < 5; i++) {
+    const a = -Math.PI / 2 + (i / 5) * Math.PI * 2;
+    inner.push([cx + r * 0.62 * Math.cos(a), cy + r * 0.62 * Math.sin(a)]);
+  }
+  polyShape(inner, C(66, 86, 120));
+  // Gold coin, top right — clear of the bars and the arrow.
+  const coinX = x + w - 20, coinY = y + 14;
+  circleFill(coinX, coinY, 10, C(212, 164, 60));
+  circleFill(coinX, coinY, 7.5, C(232, 190, 90));
+  // Descending bars, right side, below the coin.
+  const barX0 = x + w * 0.52, barW = w * 0.09, gap = w * 0.035;
+  const barBase = y + h - 8;
+  const heights = [0.52, 0.42, 0.32, 0.22];
   for (let i = 0; i < 4; i++) {
-    fillRect(bx + i * (bw + 7), by - heights[i], bw, heights[i], rgb("#b23a2e"));
+    const bx = barX0 + i * (barW + gap);
+    rectFill(bx, barBase - h * heights[i], bx + barW, barBase, C(178, 52, 40));
   }
-  line(bx - 6, by + 2, bx + 4 * bw + 28, by + 2, 1.6, rgb("#46536a"));
-  strokePath([[bx - 2, by - 50], [bx + 30, by - 34], [bx + 62, by - 18]], 2, rgb("#8a2a20"), false);
-  // Gold coin.
-  circle(x + w * 0.88, y + h * 0.24, 13, GOLDDK);
-  circle(x + w * 0.88, y + h * 0.24, 10.5, GOLD);
-  drawText("$", x + w * 0.88, y + h * 0.24 - 7, 14, rgb("#7a5c14"), { align: "c" });
+  // Trend arrow: floats ABOVE the bar tops with a clear gap, ends left of the coin.
+  const ax0 = barX0 - 6, ay0 = barBase - h * 0.62;
+  const ax1 = barX0 + 3 * (barW + gap) + barW - 4, ay1 = barBase - h * 0.34;
+  lineDraw(ax0, ay0, ax1, ay1, 2.5, C(140, 40, 30));
+  polyShape([[ax1, ay1], [ax1 - 9, ay1 - 2], [ax1 - 5, ay1 + 7]], C(140, 40, 30));
 }
 
-function sceneRwanda(x, y, w, h) {
-  vgrad(x, y, w, h, rgb("#f6d9a0"), rgb("#e8b06a"));
-  circle(x + w * 0.82, y + h * 0.2, 11, rgb("#fff3cf"));
-  fillRect(x, y + h * 0.78, w, h * 0.22, rgb("#c99a5b"));
-  // Acacia tree, left, clear of the map.
-  const tx = x + w * 0.14, ty = y + h * 0.78;
-  strokePath([[tx, ty], [tx + 2, ty - 18], [tx - 3, ty - 30]], 3, rgb("#5a4632"), false);
-  strokePath([[tx + 2, ty - 18], [tx + 9, ty - 28]], 2, rgb("#5a4632"), false);
-  ellipse(tx - 2, ty - 32, 20, 5, rgb("#4a6b35"));
-  ellipse(tx - 2, ty - 36, 13, 4, rgb("#557a3d"));
-  // Africa shape with TRUE aspect (equal px per degree) so it reads as Africa.
-  const aBoxX = x + w * 0.42, aBoxY = y + h * 0.02, aBoxW = w * 0.54, aBoxH = h * 0.74;
-  const sc = Math.min(aBoxW / 70, aBoxH / 70);
-  const aW = 70 * sc, aH = 70 * sc;
-  const aX0 = aBoxX + (aBoxW - aW) / 2, aY0 = aBoxY + (aBoxH - aH) / 2;
-  const projA = (lon, lat) => [aX0 + (lon + 18) * sc, aY0 + (35 - lat) * sc];
-  const apts = AFRICA.map(([lo, la]) => projA(lo, la));
-  fillPoly(apts, rgb("#d8b878"));
-  strokePath(apts, 1.2, rgb("#7a5230"), true);
-  // Dashed flight arc from upper left down to the Rwanda pin.
-  const [pinX, pinY] = projA(30, -2);
-  const arc = quad([x + w * 0.28, y + h * 0.14], [x + w * 0.44, y + h * 0.02], [pinX - 12, pinY - 8], 16);
-  for (let i = 0; i < arc.length - 1; i++) {
-    if (i % 2 === 0) line(arc[i][0], arc[i][1], arc[i + 1][0], arc[i + 1][1], 1.5, rgb("#8a2a20"));
+function drawRwanda(x: number, y: number, w: number, h: number): void {
+  rectGradient(x, y, x + w, y + h, C(227, 201, 143), C(214, 182, 120));
+  circleFill(x + w - 24, y + 14, 10, C(248, 236, 200));
+  // Africa, simplified but recognizable, right of center.
+  const ax = x + w * 0.58, ay = y + h * 0.5;
+  const africa: Path = [
+    [ax - 30, ay - 26], [ax - 8, ay - 30], [ax + 16, ay - 26], [ax + 30, ay - 18],
+    [ax + 34, ay - 4], [ax + 26, ay + 8], [ax + 18, ay + 22], [ax + 6, ay + 30],
+    [ax - 8, ay + 26], [ax - 18, ay + 12], [ax - 26, ay - 2], [ax - 34, ay - 12],
+  ];
+  polyShape(africa, C(185, 138, 74));
+  // Dotted flight path from the top-left plane down to the pin.
+  const px0 = x + w * 0.16, py0 = y + h * 0.14;
+  const px1 = ax + 12, py1 = ay - 6;
+  for (let i = 0; i <= 12; i++) {
+    const t = i / 12;
+    const bx = (1 - t) * (1 - t) * px0 + 2 * (1 - t) * t * ((px0 + px1) / 2) + t * t * px1;
+    const by = (1 - t) * (1 - t) * py0 + 2 * (1 - t) * t * (Math.min(py0, py1) - 14) + t * t * py1;
+    circleFill(bx, by, 2, C(110, 80, 45));
   }
-  // Plane riding the arc, clear of the pin and the tree.
-  airliner(x + w * 0.38, y + h * 0.1, 9, rgb("#2b3442"));
-  // Pin at Kigali.
-  circle(pinX, pinY - 6, 6, RED);
-  fillPoly([[pinX - 5, pinY - 3], [pinX + 5, pinY - 3], [pinX, pinY + 6]], RED);
-  circle(pinX, pinY - 6, 2.4, WHITE);
+  // Small plane at the path start.
+  polyShape([[px0 - 11, py0], [px0 + 11, py0 - 2.5], [px0 + 14, py0], [px0 + 11, py0 + 2.5],
+    [px0 - 11, py0 + 2.5]], C(70, 70, 74));
+  polyShape([[px0, py0], [px0 + 4, py0 - 7.5], [px0 + 8, py0 - 7.5], [px0 + 5, py0]], C(70, 70, 74));
+  // Map pin on Rwanda (east-center of the continent).
+  const pinX = ax + 12, pinY = ay - 6;
+  circleFill(pinX, pinY - 5, 6, C(198, 52, 38));
+  polyShape([[pinX - 5, pinY - 2], [pinX + 5, pinY - 2], [pinX, pinY + 8]], C(198, 52, 38));
+  circleFill(pinX, pinY - 5, 2.5, C(250, 245, 235));
+  // Acacia tree, far left.
+  const tx = x + w * 0.12, ty = y + h - 8;
+  lineDraw(tx, ty, tx + 3, ty - 22, 3, C(110, 80, 50));
+  ellipseFill(tx + 4, ty - 26, 20, 6, C(90, 130, 70));
+  ellipseFill(tx + 4, ty - 30, 13, 4.5, C(100, 140, 76));
 }
 
-// ---------------------------------------------------------------- page
-const LEADS = [
-  { cat: "EUROPE - WAR", color: RED, head: "CRIMEA BRIDGE HIT AGAIN", deck: "DRONES AND MISSILES DROP THE KERCH ROAD ARCH INTO THE STRAIT.", scene: sceneBridge },
-  { cat: "GULF - SHIPPING", color: TEAL, head: "TANKERS HIT BY MINES NEAR HORMUZ", deck: "A FOURTH TANKER CATCHES FIRE AS IRAN REPORTS MINE STRIKES.", scene: sceneTanker },
-  { cat: "DIPLOMACY - SHENZHEN", color: PURPLE, head: "TRUMP LANDS IN ASIA FOR APEC", deck: "MANILA FIRST, THEN SHENZHEN FOR THE FIRST XI-TRUMP-PUTIN TALKS.", scene: sceneShenzhen },
-  { cat: "ASIA - SECURITY", color: BLUE, head: "JAPAN SCRAMBLES JETS", deck: "TWO SUSPECTED RUSSIAN AIRCRAFT ENTER AIRSPACE NEAR OKINOSHIMA.", scene: sceneJets },
-  { cat: "UNITED STATES - DEFENCE", color: BROWN, head: "PENTAGON FAILS ITS AUDIT", deck: "NINTH STRAIGHT YEAR: BOOKS COVERING $4.8 TRILLION UNVERIFIED.", scene: scenePentagon },
-  { cat: "EUROPE - MIGRATION", color: GREEN, head: "FIVE EU STATES PLAN RWANDA HUB", deck: "GERMANY, DENMARK, AUSTRIA, GREECE, NETHERLANDS BACK A HUB.", scene: sceneRwanda },
+// ================================================================= LAYOUT ===
+const sansReg = buildSans(13);
+const sansMed = buildSans(15);
+const sansBold = buildSans(17);
+const serif = buildSerif();
+
+function diamond(cx: number, cy: number, r: number, rgb: RGB): void {
+  polyShape([[cx, cy - r], [cx + r, cy], [cx, cy + r], [cx - r, cy]], rgb);
+}
+
+function drawFrame(): void {
+  fillCanvas(NAVY_DK);
+  rectFill(4, 4, 1020, 7, GOLD);
+  rectFill(4, 1017, 1020, 1020, GOLD);
+  rectFill(4, 4, 7, 1020, GOLD);
+  rectFill(1017, 4, 1020, 1020, GOLD);
+  rectFill(10, 10, 1014, 11, GOLD);
+  rectFill(10, 1013, 1014, 1014, GOLD);
+  rectFill(10, 10, 11, 1014, GOLD);
+  rectFill(1013, 10, 1014, 1014, GOLD);
+}
+
+function drawMasthead(): void {
+  const str = "THE WORLD IN ONE DAY";
+  const size = 32, tracking = 10;
+  const w = textWidth(str, serif, size, tracking);
+  const x0 = 512 - w / 2, x1 = 512 + w / 2;
+  // Flanking rules with diamonds.
+  rectFill(40, 38, x0 - 20, 39.5, GOLD);
+  rectFill(x1 + 20, 38, 984, 39.5, GOLD);
+  diamond(x0 - 11, 38.75, 4, GOLD);
+  diamond(x1 + 11, 38.75, 4, GOLD);
+  drawText(str, 512, 50, serif, size, GOLD_PALE, tracking, "center");
+}
+
+function drawDate(): void {
+  // Three segments: white TUESDAY, gold 17, white NOVEMBER 2026.
+  const segs: Array<[string, RGB]> = [
+    ["TUESDAY ", WHITE],
+    ["17", GOLD_BRIGHT],
+    [" NOVEMBER 2026", WHITE],
+  ];
+  const tracking = 2;
+  let size = 96;
+  const total = (s: number): number => segs.reduce((a, [t]) => a + textWidth(t, serif, s, tracking), 0);
+  while (size > 40 && total(size) > 988) size -= 0.5;
+  let pen = 512 - total(size) / 2;
+  const baseline = 58 + size * 0.7;
+  for (const [t, rgb] of segs) {
+    drawText(t, pen, baseline, serif, size, rgb, tracking, "left");
+    pen += textWidth(t, serif, size, tracking);
+  }
+  // Double gold rule + subhead.
+  rectFill(12, 132, 1012, 134, GOLD);
+  rectFill(12, 136, 1012, 137, GOLD);
+  drawText("34 STORIES THAT DEFINED THE DAY", 512, 156, serif, 20, GOLD, 12, "center");
+}
+
+function drawMap(): void {
+  rectFill(MAP_X0, MAP_Y0, MAP_X1, MAP_Y1, C(13, 36, 70));
+  for (let gx = MAP_X0; gx <= MAP_X1; gx += 62.5) lineDraw(gx, MAP_Y0, gx, MAP_Y1, 0.7, NAVY_LINE);
+  for (let gy = MAP_Y0; gy <= MAP_Y1; gy += 27) lineDraw(MAP_X0, gy, MAP_X1, gy, 0.7, NAVY_LINE);
+  const land = C(201, 162, 75);
+  for (const cont of CONTINENTS) {
+    polyShape(cont.map(([lo, la]) => project(lo, la)), land);
+  }
+  // City labels: navy chips + gold leader lines, then dots on top.
+  const labelSize = 11.5;
+  const dots: Array<[number, number]> = [];
+  for (const city of CITIES) {
+    const [dx, dy] = project(city.lon, city.lat);
+    const dotX = dx + city.dx, dotY = dy + city.dy;
+    dots.push([dotX, dotY]);
+    const tw = textWidth(city.name, sansBold, labelSize, 1);
+    let chipX0: number;
+    if (city.align === "right") chipX0 = city.lx - tw - 4;
+    else if (city.align === "center") chipX0 = city.lx - tw / 2 - 4;
+    else chipX0 = city.lx - 4;
+    const chipY0 = city.ly - labelSize * 0.7 - 3;
+    const chipX1 = chipX0 + tw + 8, chipY1 = city.ly + 3;
+    rectFill(chipX0, chipY0, chipX1, chipY1, NAVY_DK);
+    // Leader from chip edge toward the dot.
+    const ccx = (chipX0 + chipX1) / 2, ccy = (chipY0 + chipY1) / 2;
+    const ddx = dotX - ccx, ddy = dotY - ccy;
+    const hw = (chipX1 - chipX0) / 2, hh = (chipY1 - chipY0) / 2;
+    const tt = Math.min(Math.abs(ddx) > 0.01 ? hw / Math.abs(ddx) : 99,
+      Math.abs(ddy) > 0.01 ? hh / Math.abs(ddy) : 99);
+    const sx = ccx + ddx * Math.min(tt, 1), sy = ccy + ddy * Math.min(tt, 1);
+    lineDraw(sx, sy, dotX, dotY, 1, GOLD);
+    drawText(city.name, city.lx, city.ly, sansBold, labelSize, CREAM, 1, city.align);
+  }
+  for (const [dotX, dotY] of dots) {
+    circleFill(dotX, dotY, 5, WHITE);
+    circleFill(dotX, dotY, 3.2, RED);
+  }
+  // Panel title chip.
+  const title = "WHERE IT HAPPENED";
+  const tw = textWidth(title, sansBold, 11, 2);
+  rectFill(18, 168, 18 + tw + 12, 185, GOLD);
+  drawText(title, 24, 180, sansBold, 11, NAVY_DK, 2, "left");
+  // Panel border.
+  rectFill(MAP_X0, MAP_Y0, MAP_X1, MAP_Y0 + 1.5, GOLD);
+  rectFill(MAP_X0, MAP_Y1 - 1.5, MAP_X1, MAP_Y1, GOLD);
+  rectFill(MAP_X0, MAP_Y0, MAP_X0 + 1.5, MAP_Y1, GOLD);
+  rectFill(MAP_X1 - 1.5, MAP_Y0, MAP_X1, MAP_Y1, GOLD);
+}
+
+interface Lead {
+  cat: string; color: RGB; art: (x: number, y: number, w: number, h: number) => void;
+  head: string[]; deck: string[];
+}
+const LEADS: Lead[] = [
+  { cat: "EUROPE - WAR", color: C(192, 69, 47), art: drawBridge,
+    head: ["CRIMEA BRIDGE", "HIT AGAIN"],
+    deck: ["DRONES AND MISSILES DROP THE", "KERCH ROAD ARCH INTO THE STRAIT."] },
+  { cat: "GULF - SHIPPING", color: C(46, 125, 107), art: drawTanker,
+    head: ["TANKERS HIT BY MINES", "NEAR HORMUZ"],
+    deck: ["A FOURTH TANKER CATCHES FIRE AS", "IRAN REPORTS MINE STRIKES."] },
+  { cat: "DIPLOMACY - SHENZHEN", color: C(123, 75, 166), art: drawShenzhen,
+    head: ["TRUMP LANDS IN ASIA", "FOR APEC"],
+    deck: ["MANILA FIRST, THEN SHENZHEN FOR", "THE FIRST XI-TRUMP-PUTIN TALKS."] },
+  { cat: "ASIA - SECURITY", color: C(46, 107, 168), art: drawJets,
+    head: ["JAPAN SCRAMBLES JETS"],
+    deck: ["TWO SUSPECTED RUSSIAN AIRCRAFT", "ENTER AIRSPACE NEAR OKINOSHIMA."] },
+  { cat: "UNITED STATES - DEFENCE", color: C(138, 109, 43), art: drawPentagon,
+    head: ["PENTAGON FAILS", "ITS AUDIT"],
+    deck: ["NINTH STRAIGHT YEAR: BOOKS", "COVERING $4.8 TRILLION UNVERIFIED."] },
+  { cat: "EUROPE - MIGRATION", color: C(62, 142, 77), art: drawRwanda,
+    head: ["FIVE EU STATES PLAN", "RWANDA HUB"],
+    deck: ["GERMANY, DENMARK, AUSTRIA,", "GREECE, NETHERLANDS BACK A HUB."] },
 ];
-const GRID = [
-  ["HEALTH", RED, "U.S. LOSES MEASLES-FREE STATUS AFTER 26 YEARS; 5,412 CASES"],
-  ["MARKETS", BROWN, "NVIDIA BEATS, GUIDES TO $130BN IN FIRST REPORT WITHOUT HUANG"],
-  ["MARKETS", BROWN, "WALL STREET FALLS; S&P -1.0%, DOW -1.6%, VIX AT 25.5"],
-  ["SPACE", BLUE, "VULCAN GROUNDED: BOOSTER UNDERPERFORMED, 40 SATELLITES LOST"],
-  ["TECH", TEAL, "U.S. MOVES TO CLOSE AI CHIP LOOPHOLE ON DATA CENTERS"],
-  ["TECH", TEAL, "JPMORGAN BLAMES SOFTWARE BUG FOR MONDAY BANKING OUTAGE"],
-  ["ENERGY", RED, "OIL RISES ON HORMUZ TENSION: BRENT $93.14, WTI $86.01"],
-  ["WEATHER", BLUE, "CYCLONE AKVAN NEARS ANDHRA COAST; LANDFALL DUE NOV 20"],
-  ["SPORT", GREEN, "MOROCCO REACHES FIFA TOP FIVE, FIRST AFRICAN SIDE SINCE 1994"],
-  ["SPORT", GREEN, "JAY SHAH RE-ELECTED AS ICC CHAIRMAN FOR A SECOND TERM"],
-  ["ASIA", PURPLE, "SEOUL SCRAMBLES JETS TOO; TAIWAN RESPONDS TO RUSSIAN FLIGHTS"],
-  ["U.S.", RED, "WHITE HOUSE CURBS TESTIMONY; AGENCIES NEED PRIOR APPROVAL"],
+
+function drawLeads(): void {
+  const colW = 328, gap = 8, rowH = 152;
+  for (let i = 0; i < 6; i++) {
+    const col = i % 3, row = Math.floor(i / 3);
+    const x = 12 + col * (colW + gap);
+    const y = 276 + row * (rowH + 6);
+    const lead = LEADS[i];
+    rectFill(x, y, x + colW, y + rowH, PAPER);
+    rectFill(x, y, x + colW, y + 22, lead.color);
+    drawText(lead.cat, x + 10, y + 15.5, sansBold, 12.5, WHITE, 3, "left");
+    lead.art(x, y + 22, colW, 58);
+    const headSize = 20.5;
+    const n = lead.head.length;
+    for (let li = 0; li < n; li++) {
+      fitText(lead.head[li], x + 10, y + 97 + li * 23, sansBold, headSize, colW - 20, INK, 0.5, "left");
+    }
+    for (let li = 0; li < lead.deck.length; li++) {
+      drawText(lead.deck[li], x + 10, y + 136 + li * 13, sansReg, 11, SLATE, 0.5, "left");
+    }
+  }
+}
+
+interface GridItem { cat: string; lines: string[]; }
+const GRID: GridItem[] = [
+  { cat: "HEALTH", lines: ["U.S. LOSES MEASLES-FREE", "STATUS: 5,412 CASES, 26 YEARS"] },
+  { cat: "MARKETS", lines: ["NVIDIA BEATS, GUIDES TO $130BN", "IN FIRST REPORT WITHOUT HUANG"] },
+  { cat: "MARKETS", lines: ["WALL STREET FALLS: S&P -1.0%,", "DOW -1.6%, VIX AT 25.5"] },
+  { cat: "SPACE", lines: ["VULCAN GROUNDED: BOOSTER", "FAULT, 40 SATELLITES LOST"] },
+  { cat: "TECH", lines: ["U.S. MOVES TO CLOSE AI CHIP", "LOOPHOLE ON DATA CENTERS"] },
+  { cat: "TECH", lines: ["JPMORGAN BLAMES SOFTWARE BUG", "FOR MONDAY BANKING OUTAGE"] },
+  { cat: "ENERGY", lines: ["OIL RISES ON HORMUZ TENSION:", "BRENT $93.14, WTI $86.01"] },
+  { cat: "WEATHER", lines: ["CYCLONE AKVAN NEARS ANDHRA", "COAST; LANDFALL DUE NOV 20"] },
+  { cat: "SPORT", lines: ["MOROCCO REACHES FIFA TOP FIVE,", "FIRST AFRICAN SIDE SINCE 1994"] },
+  { cat: "SPORT", lines: ["JAY SHAH RE-ELECTED AS ICC", "CHAIRMAN FOR A SECOND TERM"] },
+  { cat: "ASIA", lines: ["SEOUL SCRAMBLES JETS TOO;", "TAIWAN RESPONDS TO RUSSIAN JETS"] },
+  { cat: "U.S.", lines: ["WHITE HOUSE CURBS TESTIMONY:", "AGENCIES NEED PRIOR APPROVAL"] },
 ];
-const ALSO_L = [
-  "DISNEY BEATS; REVENUE $25.9BN, DIVIDEND RAISED",
-  "FED'S MUSALEM: MORE HIKES MAY BE NEEDED",
-  "NSA CLASSIFIED NETWORK DOWN; NO SIGN OF CYBERATTACK",
+
+function drawGrid(): void {
+  const y0 = 592, colW = 328, gap = 8, rowH = 45;
+  rectFill(12, y0, 1012, y0 + 4 * rowH, PAPER);
+  for (let i = 0; i < 12; i++) {
+    const col = i % 3, row = Math.floor(i / 3);
+    const x = 12 + col * (colW + gap);
+    const y = y0 + row * rowH;
+    const item = GRID[i];
+    // Number badge.
+    circleFill(x + 17, y + 22, 12, RED);
+    drawText(String(i + 1), x + 17, y + 27, sansBold, 13, WHITE, 0, "center");
+    drawText(item.cat, x + 36, y + 13, sansBold, 9.5, RED, 2, "left");
+    for (let li = 0; li < item.lines.length; li++) {
+      fitText(item.lines[li], x + 36, y + 27 + li * 13, sansMed, 12.5, colW - 44, INK, 0, "left");
+    }
+    if (col > 0) rectFill(x - gap / 2 - 0.5, y + 5, x - gap / 2 + 0.5, y + rowH - 5, PAPER_DK);
+    if (row > 0) rectFill(x + 5, y - 0.5, x + colW - 5, y + 0.5, PAPER_DK);
+  }
+  rectFill(12, y0, 1012, y0 + 1.5, GOLD);
+  rectFill(12, y0 + 4 * rowH - 1.5, 1012, y0 + 4 * rowH, GOLD);
+}
+
+const ALSO_LEFT = [
+  "DISNEY BEATS: REVENUE $25.9BN, DIVIDEND RAISED",
+  "FED'S MUSELEM: MORE HIKES MAY BE NEEDED",
+  "NSA NETWORK DOWN; NO SIGN OF CYBERATTACK",
   "APPLE SERVICES HIT BY OUTAGE ON TUESDAY",
-  "GAZA FLOODS DAMAGE SHELTERS; TENTS HELD AT BORDER",
+  "GAZA FLOODS HIT SHELTERS; TENTS HELD AT BORDER",
   "CYBERCRIME DAMAGES PUT AT $10.5T A YEAR",
   "RICE AGREES 5-YEAR ARSENAL DEAL",
   "PATIDAR SMASHES 135 OFF 48 BALLS",
 ];
-const ALSO_R = [
+const ALSO_RIGHT = [
   "U.S. RETAIL SALES RISE 0.2% IN OCTOBER",
   "ANTHROPIC IPO PRICES WEDNESDAY, NEAR $1.5T",
   "DRONES OVER BAHRAIN BASE INTERCEPTED",
-  "HOUTHI ADVANCE; IRAQI ARMY PULLS BACK",
+  "HOUTHIS ADVANCE ON ADEN; FORCES PULL BACK",
   "BUS CRASH IN UTTARAKHAND KILLS 8",
   "DHONI RETIRES FROM IPL AS A PLAYER",
   "SHAMI TO RAJASTHAN; CURRAN TO LUCKNOW",
   "INDIA WINS SAFF TITLE HAT-TRICK",
 ];
 
-function drawLeadPanel(px, py, pw, ph, lead, idx) {
-  fillRect(px, py, pw, ph, CREAM);
-  // Gold hairline border.
-  fillRect(px, py, pw, 1.5, GOLD); fillRect(px, py + ph - 1.5, pw, 1.5, GOLD);
-  fillRect(px, py, 1.5, ph, GOLD); fillRect(px + pw - 1.5, py, 1.5, ph, GOLD);
-  // Category bar.
-  fillRect(px + 1.5, py + 1.5, pw - 3, 22, lead.color);
-  drawText(lead.cat, px + 10, py + 7, 12, WHITE, { tracking: 1 });
-  // Illustration.
-  const ay = py + 23.5, ah = 86;
-  setClip(px + 1.5, ay, px + pw - 1.5, ay + ah);
-  lead.scene(px + 1.5, ay, pw - 3, ah);
-  clearClip();
-  // Headline, up to 2 lines.
-  const lines = wrapText(lead.head, 21, pw - 20, 0.5).slice(0, 2);
-  let hy = ay + ah + 6;
-  for (const ln of lines) { drawText(ln, px + 10, hy, 21, INK, { tracking: 0.5 }); hy += 23; }
-  // Deck, up to 2 lines.
-  const dlines = wrapText(lead.deck, 11.5, pw - 20, 0).slice(0, 2);
-  let dy = ay + ah + 52;
-  for (const ln of dlines) { drawText(ln, px + 10, dy, 11.5, SLATE, {}); dy += 13; }
+function drawAlso(): void {
+  const y0 = 778, y1 = 940;
+  rectFill(12, y0, 1012, y1, NAVY_PANEL);
+  rectFill(12, y0, 1012, y0 + 1.5, GOLD);
+  rectFill(12, y1 - 1.5, 1012, y1, GOLD);
+  rectFill(12, y0, 13.5, y1, GOLD);
+  rectFill(1010.5, y0, 1012, y1, GOLD);
+  const header = "ALSO ON TUESDAY 17 NOVEMBER";
+  const hw = textWidth(header, serif, 21, 6);
+  drawText(header, 512, 802, serif, 21, GOLD_BRIGHT, 6, "center");
+  rectFill(40, 794, 512 - hw / 2 - 16, 795.5, GOLD);
+  rectFill(512 + hw / 2 + 16, 794, 984, 795.5, GOLD);
+  diamond(512 - hw / 2 - 9, 794.75, 3.5, GOLD);
+  diamond(512 + hw / 2 + 9, 794.75, 3.5, GOLD);
+  // Large, bright, high-contrast type: the section the user asked to see.
+  const size = 15.5;
+  const cols: Array<[number, string[]]> = [[30, ALSO_LEFT], [522, ALSO_RIGHT]];
+  for (const [cx, items] of cols) {
+    for (let i = 0; i < items.length; i++) {
+      const baseline = 820 + i * 16.5;
+      diamond(cx + 3, baseline - 5, 4, GOLD_BRIGHT);
+      fitText(items[i], cx + 16, baseline, sansMed, size, 462, WHITE, 0, "left");
+    }
+  }
 }
 
-function main() {
-  vgrad(0, 0, W, H, rgb("#0c1a36"), NAVY3);
-  // Double gold frame.
-  fillRect(6, 6, W - 12, 2, GOLD); fillRect(6, H - 8, W - 12, 2, GOLD);
-  fillRect(6, 6, 2, H - 12, GOLD); fillRect(W - 8, 6, 2, H - 12, GOLD);
-  fillRect(13, 13, W - 26, 1, GOLDDK); fillRect(13, H - 14, W - 26, 1, GOLDDK);
-  fillRect(13, 13, 1, H - 26, GOLDDK); fillRect(W - 14, 13, 1, H - 26, GOLDDK);
+function drawFooter(): void {
+  drawText("SOURCES: REUTERS, AP, BBC, AL JAZEERA, JAPAN DEFENSE MINISTRY, PAHO, ULA, IMD, NDTV",
+    512, 960, sansReg, 11, GOLD_PALE, 1, "center");
+  drawText("EVERY STORY ABOVE HAPPENED OR WAS FIRST REPORTED ON TUESDAY 17 NOVEMBER 2026.",
+    512, 983, sansBold, 13.5, GOLD_BRIGHT, 1, "center");
+}
 
-  // Masthead.
-  const mh = "THE WORLD IN ONE DAY";
-  const mhw = textWidth(mh, 25, 6);
-  drawText(mh, 512, 22, 25, GOLDLT, { align: "c", tracking: 6 });
-  hline(40, 35, 512 - mhw / 2 - 70, GOLDDK, 1.2);
-  hline(512 + mhw / 2 + 30, 35, 512 - mhw / 2 - 70, GOLDDK, 1.2);
-  diamond(512 - mhw / 2 - 16, 35, 4, GOLD);
-  diamond(512 + mhw / 2 + 16, 35, 4, GOLD);
-
-  // Giant date, mixed colors, fitted.
-  const segs = [["TUESDAY ", WHITE], ["17", GOLDLT], [" NOVEMBER 2026", WHITE]];
-  let ds = 62;
-  const dateW = (s) => segs.reduce((t, [txt]) => t + textWidth(txt, s, 2), 0);
-  while (ds > 20 && dateW(ds) > 968) ds -= 1;
-  let dx = 512 - dateW(ds) / 2;
-  for (const [txt, col] of segs) {
-    drawText(txt, dx + 2, 50 + 2, ds, NAVY3, { tracking: 2 });
-    drawText(txt, dx, 50, ds, col, { tracking: 2 });
-    dx += textWidth(txt, ds, 2);
-  }
-  // Rules under the date.
-  hline(34, 120, 956, GOLD, 2);
-  hline(34, 124, 956, GOLDDK, 0.8);
-
-  drawText("34 STORIES THAT DEFINED THE DAY", 512, 130, 14, GOLD, { align: "c", tracking: 4 });
-
-  // World map panel.
-  const mapY = 150, mapH = 126;
-  fillRect(16, mapY, 992, mapH, NAVY2);
-  setClip(16, mapY, 1008, mapY + mapH);
-  drawMap(16, mapY, 992, mapH);
-  clearClip();
-  fillRect(16, mapY, 992, 1.5, GOLD); fillRect(16, mapY + mapH - 1.5, 992, 1.5, GOLD);
-  fillRect(16, mapY, 1.5, mapH, GOLD); fillRect(1006.5, mapY, 1.5, mapH, GOLD);
-
-  // Lead stories: 2 rows x 3.
-  const colX = [16, 350, 684], colW = 322, rowY = [284, 484], rowH = 192;
-  for (let i = 0; i < 6; i++) {
-    drawLeadPanel(colX[i % 3], rowY[Math.floor(i / 3)], colW, rowH, LEADS[i], i);
-  }
-
-  // Numbered grid: 4 rows x 3.
-  const gridY = 684, gridH = 160;
-  fillRect(16, gridY, 992, gridH, CREAM);
-  fillRect(16, gridY, 992, 1.5, GOLD); fillRect(16, gridY + gridH - 1.5, 992, 1.5, GOLD);
-  fillRect(16, gridY, 1.5, gridH, GOLD); fillRect(1006.5, gridY, 1.5, gridH, GOLD);
-  const rowH2 = gridH / 4;
-  for (let i = 0; i < 12; i++) {
-    const gx = colX[i % 3], gy = gridY + Math.floor(i / 3) * rowH2;
-    if (i % 3 > 0) vline(gx - 6, gy + 5, rowH2 - 10, rgb("#d8cdb2"), 1);
-    if (i >= 3) hline(gx + 4, gy - 0.5, colW - 8, rgb("#d8cdb2"), 1);
-    const [cat, col, txt] = GRID[i];
-    circle(gx + 15, gy + rowH2 / 2, 11, RED);
-    drawText(String(i + 1), gx + 15, gy + rowH2 / 2 - 7, 14, WHITE, { align: "c" });
-    drawText(cat, gx + 32, gy + 4, 9.5, col, { tracking: 1 });
-    const gl = wrapText(txt, 11, colW - 42, 0).slice(0, 2);
-    let ly = gy + 16;
-    for (const ln of gl) { drawText(ln, gx + 32, ly, 11, INK, {}); ly += 12.5; }
-  }
-
-  // ALSO panel.
-  const alsoY = 852, alsoH = 108;
-  fillRect(16, alsoY, 992, alsoH, NAVY2);
-  fillRect(16, alsoY, 992, 1.5, GOLD); fillRect(16, alsoY + alsoH - 1.5, 992, 1.5, GOLD);
-  fillRect(16, alsoY, 1.5, alsoH, GOLD); fillRect(1006.5, alsoY, 1.5, alsoH, GOLD);
-  drawText("ALSO ON TUESDAY 17 NOVEMBER", 512, alsoY + 7, 13, GOLD, { align: "c", tracking: 3 });
-  hline(300, alsoY + 25, 424, GOLDDK, 0.8);
-  const alsoRow = (items, ax) => {
-    for (let i = 0; i < items.length; i++) {
-      const iy = alsoY + 32 + i * 9.4;
-      fillRect(ax, iy + 3, 4, 4, GOLD);
-      drawText(items[i], ax + 10, iy, 9, rgb("#dbe4f0"), {});
-    }
-  };
-  alsoRow(ALSO_L, 30);
-  alsoRow(ALSO_R, 516);
-  vline(506, alsoY + 32, 70, rgb("#24406a"), 1);
-
-  // Footer.
-  drawText("SOURCES: REUTERS, AP, BBC, AL JAZEERA, JAPAN DEFENSE MINISTRY, PAHO, ULA, IMD, NDTV", 512, 968, 10.5, FAINT, { align: "c", tracking: 0.5 });
-  drawText("EVERY STORY ABOVE HAPPENED OR WAS FIRST REPORTED ON TUESDAY 17 NOVEMBER 2026.", 512, 986, 12.5, GOLDLT, { align: "c", tracking: 0.5 });
-
-  const outDir = process.env.MAKEFUN_OUTPUT_DIR || "/output";
-  const file = path.join(outDir, "entry.png");
-  const n = writePng(file);
-  console.log(JSON.stringify({ file, bytes: n, width: W, height: H }));
+// =================================================================== MAIN ===
+function main(): void {
+  drawFrame();
+  drawMasthead();
+  drawDate();
+  drawMap();
+  drawLeads();
+  drawGrid();
+  drawAlso();
+  drawFooter();
+  const rgb = downsample();
+  const png = encodePNG(rgb);
+  fs.mkdirSync("/output", { recursive: true });
+  fs.writeFileSync("/output/entry.png", png);
 }
 
 main();
