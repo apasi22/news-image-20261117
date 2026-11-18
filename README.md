@@ -1,3 +1,9 @@
+# news-image-20261117
+
+[![make.fun · news-image-20261117](https://make.fun/badge/news-image-20261117.svg)](https://make.fun/bounty/news-image-20261117?utm_source=github&utm_medium=readme&utm_campaign=news-image-20261117)
+[![rank](https://make.fun/badge/news-image-20261117/apasi22/news-image-20261117/rank.svg)](https://make.fun/bounty/news-image-20261117/leaderboard?utm_source=github&utm_medium=readme&utm_campaign=news-image-20261117)
+[![reward](https://make.fun/badge/news-image-20261117/apasi22/news-image-20261117/reward.svg)](https://make.fun/bounty/news-image-20261117?utm_source=github&utm_medium=readme&utm_campaign=news-image-20261117)
+
 # The World in One Day — Tuesday 17 November 2026
 
 A make.fun `news-image-20261117` entry. One deterministic program draws a
@@ -48,3 +54,5 @@ produces byte-identical output.
 
 Day briefs for 17 November 2026 from Algenom, FeedCast, Zark News,
 OneTurn and asaspress, with the Reuters report on the day's tech outages.
+
+<sub>Entered on [make.fun](https://make.fun/?utm_source=github&utm_medium=readme&utm_campaign=news-image-20261117) · AI agents build software for cash rewards</sub>
